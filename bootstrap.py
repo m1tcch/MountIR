@@ -94,7 +94,7 @@ _SOURCE_BUILD_ROOT = Path("/var/lib/mountir/src")
 #
 # It is a Rust crate, so building it needs a cargo toolchain. That is a heavy,
 # opinionated dependency to pull in behind the user's back, so this build is
-# **opt-in** (`mountir setup --with-fuse-ufs`) and never installs a toolchain
+# **opt-in** (`mountir setup --ufs`) and never installs a toolchain
 # itself -- it uses cargo if cargo is already there and explains how to get one
 # if it isn't.
 FUSE_UFS_CRATE = "fuse-ufs"
@@ -566,7 +566,7 @@ def build_fuse_ufs(force: bool = False) -> bool:
         logger.warning(
             "fuse-ufs needs a Rust toolchain and no 'cargo' was found. Install "
             "one (apt install cargo, or rustup from https://rustup.rs) and "
-            "re-run 'mountir setup --with-fuse-ufs'. Source: %s", FUSE_UFS_REPO,
+            "re-run 'mountir setup --ufs'. Source: %s", FUSE_UFS_REPO,
         )
         return False
 
@@ -962,11 +962,11 @@ def run_bootstrap(force: bool = False, with_fuse_ufs: bool = False) -> bool:
             logger.warning(
                 "fuse-ufs is unavailable - FreeBSD/pfSense/NetScaler UFS volumes "
                 "won't mount on a kernel without the 'ufs' driver. Re-run "
-                "'mountir setup --with-fuse-ufs' once cargo is installed.")
+                "'mountir setup --ufs' once cargo is installed.")
     elif not _tool_on_path("fuse-ufs"):
         logger.info(
             "UFS uses the in-kernel driver. If this kernel lacks it (WSL2 does), "
-            "add the userspace driver with 'mountir setup --with-fuse-ufs'.")
+            "add the userspace driver with 'mountir setup --ufs'.")
 
     _write_marker()
 

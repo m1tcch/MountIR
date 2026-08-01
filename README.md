@@ -325,7 +325,7 @@ sudo apt-get install linux-modules-extra-$(uname -r) && sudo modprobe ufs
 or install the userspace driver, which MountIR then uses automatically:
 
 ```bash
-sudo mountir setup --with-fuse-ufs
+sudo mountir setup --ufs
 ```
 
 This is **opt-in** rather than part of the normal `mountir setup`, because
@@ -338,7 +338,7 @@ back:
 
 ```bash
 sudo apt-get install cargo        # or rustup, from https://rustup.rs
-sudo mountir setup --with-fuse-ufs
+sudo mountir setup --ufs
 ```
 
 `mountir check` reports which provider each filesystem will actually use —
@@ -354,7 +354,7 @@ warns but never aborts setup:
 | --- | --- | --- |
 | `apfs-fuse` | [sgan81/apfs-fuse](https://github.com/sgan81/apfs-fuse) | read-only APFS (macOS) — no apt package exists |
 | `ewfmount` *(libewf)* | [libyal/libewf](https://github.com/libyal/libewf) | EWF v2 **Ex01/Lx01** — apt ships only the 2014 legacy line |
-| `fuse-ufs` † | [asomers/fuse-ufs](https://github.com/asomers/fuse-ufs) | UFS1/UFS2 on kernels without the `ufs` driver — **opt-in**, `mountir setup --with-fuse-ufs` |
+| `fuse-ufs` † | [asomers/fuse-ufs](https://github.com/asomers/fuse-ufs) | UFS1/UFS2 on kernels without the `ufs` driver — **opt-in**, `mountir setup --ufs` |
 
 > **† `fuse-ufs` is opt-in.** It is a Rust crate, so it needs a cargo toolchain
 > — a heavy dependency to install unprompted. Plain `mountir setup` skips it and

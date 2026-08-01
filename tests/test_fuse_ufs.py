@@ -144,12 +144,12 @@ class TestSetupCli:
     """The flag reaches run_bootstrap from both setup and its legacy alias."""
 
     def test_setup_accepts_the_flag(self):
-        args = build_parser().parse_args(["setup", "--with-fuse-ufs"])
+        args = build_parser().parse_args(["setup", "--ufs"])
         assert args.with_fuse_ufs is True
 
     def test_setup_defaults_to_off(self):
         assert build_parser().parse_args(["setup"]).with_fuse_ufs is False
 
     def test_install_deps_alias_accepts_it_too(self):
-        args = build_parser().parse_args(["install-deps", "--with-fuse-ufs"])
+        args = build_parser().parse_args(["install-deps", "--ufs"])
         assert args.with_fuse_ufs is True

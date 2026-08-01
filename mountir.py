@@ -795,7 +795,7 @@ def cmd_check(args):
         ("VMFS6", "vmfs6-fuse", "vmfs6-tools", "VMware ESXi 6.5+ datastores", None),
         ("ZFS", "zpool", "zfsutils-linux",
          "ZFS pools (also needs kernel module)", None),
-        ("UFS", "fuse-ufs", "mountir setup --with-fuse-ufs",
+        ("UFS", "fuse-ufs", "mountir setup --ufs",
          "FreeBSD/NetScaler/pfSense", "ufs"),
         ("ext2/3/4, XFS, btrfs, vfat", None, "built in", "Linux/Windows volumes",
          "ext4"),
@@ -1003,7 +1003,7 @@ def cmd_setup(args):
 
     ``--force`` rebuilds the source-built tools (apfs-fuse, libewf) even when
     already present; without it an existing modern libewf/apfs-fuse is reused.
-    ``--with-fuse-ufs`` additionally installs the cargo-built UFS driver.
+    ``--ufs`` additionally installs the cargo-built UFS driver.
     """
     bootstrap.run_bootstrap(
         force=getattr(args, "force", False),
@@ -1135,7 +1135,7 @@ def build_parser() -> argparse.ArgumentParser:
              "present; set MOUNTIR_LIBEWF_VERSION to pull a newer libewf",
     )
     setup_parser.add_argument(
-        "--with-fuse-ufs", action="store_true",
+        "--ufs", dest="with_fuse_ufs", action="store_true",
         help="Also install the fuse-ufs UFS driver via cargo (needs a Rust "
              "toolchain). Required for FreeBSD/pfSense/NetScaler UFS volumes on "
              "kernels without the 'ufs' driver, such as WSL2",
@@ -1149,7 +1149,7 @@ def build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--force", action="store_true",
                                 help="Rebuild source-built tools")
     install_parser.add_argument(
-        "--with-fuse-ufs", action="store_true",
+        "--ufs", dest="with_fuse_ufs", action="store_true",
         help="Also install the fuse-ufs UFS driver via cargo",
     )
 

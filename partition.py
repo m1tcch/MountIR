@@ -944,7 +944,7 @@ _FS_PROVIDERS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
 
 # Remediation for a filesystem this host has no driver for at all.
 _NO_DRIVER_HINTS: Dict[str, str] = {
-    "ufs": "install the userspace driver with 'mountir setup --with-fuse-ufs' "
+    "ufs": "install the userspace driver with 'mountir setup --ufs' "
            "(needs cargo), or boot a kernel built with CONFIG_UFS_FS "
            "(linux-modules-extra-$(uname -r) on Ubuntu); the Microsoft WSL2 "
            "kernel ships neither",

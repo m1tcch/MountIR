@@ -278,8 +278,10 @@ class TestDriverAvailability:
             assert _driver_available("ufs") is True
 
     def test_no_driver_error_names_the_remedy(self):
+        """Naming the filesystem isn't enough - give the command that fixes it."""
         message = _no_driver_error("ufs")
-        assert "ufs" in message and "fuse-ufs" in message
+        assert "'ufs'" in message
+        assert "mountir setup --ufs" in message
 
 
 class TestDiagnoseMountFailure:
