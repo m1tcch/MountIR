@@ -57,47 +57,100 @@ class TestBuildFuseUfs:
             assert bootstrap.build_fuse_ufs() is False
         run.assert_not_called()
 
-    def test_installs_into_usr_local_so_the_binary_lands_on_path(self):
+    @staticmethod
+    def _install(run, cargo=(1, 85), force=False):
+        """Drive build_fuse_ufs with everything external stubbed out."""
         with patch("bootstrap.tool_exists", return_value=False), \
              patch("bootstrap._priv_prefix", return_value=[]), \
              patch("bootstrap.find_cargo", return_value="/usr/bin/cargo"), \
+             patch("bootstrap.cargo_version", return_value=cargo), \
              patch("bootstrap.install_system_deps", return_value=True), \
-             patch("bootstrap._run", return_value=True) as run, \
+             patch("bootstrap._run", run), \
              patch("bootstrap._tool_on_path", return_value=True):
-            assert bootstrap.build_fuse_ufs() is True
+            return bootstrap.build_fuse_ufs(force=force)
+
+    def test_installs_into_usr_local_so_the_binary_lands_on_path(self):
+        run = MagicMock(return_value=True)
+        assert self._install(run) is True
 
         cmd = run.call_args[0][0]
         assert cmd[:3] == ["/usr/bin/cargo", "install", "fuse-ufs"]
-        assert cmd[3:5] == ["--root", "/usr/local"]
+        assert "--root" in cmd and cmd[cmd.index("--root") + 1] == "/usr/local"
+
+    def test_dependencies_are_locked_to_the_released_set(self):
+        """Unlocked, cargo re-resolves and a transitive MSRV bump breaks it."""
+        run = MagicMock(return_value=True)
+        self._install(run)
+        assert "--locked" in run.call_args[0][0]
+
+    def test_modern_toolchain_installs_the_current_release(self):
+        run = MagicMock(return_value=True)
+        self._install(run, cargo=(1, 85))
+        assert "--version" not in run.call_args[0][0]
+
+    def test_old_toolchain_falls_back_to_the_pinned_release(self):
+        """Ubuntu 24.04 ships cargo 1.75; the current release needs 1.85."""
+        run = MagicMock(return_value=True)
+        assert self._install(run, cargo=(1, 75)) is True
+
+        cmd = run.call_args[0][0]
+        assert cmd[cmd.index("--version") + 1] == bootstrap.FUSE_UFS_LEGACY_VERSION
+
+    def test_unknown_cargo_version_attempts_the_current_release(self):
+        run = MagicMock(return_value=True)
+        self._install(run, cargo=None)
+        assert "--version" not in run.call_args[0][0]
 
     def test_force_passes_cargos_force_flag(self):
-        with patch("bootstrap.tool_exists", return_value=False), \
-             patch("bootstrap._priv_prefix", return_value=[]), \
-             patch("bootstrap.find_cargo", return_value="/usr/bin/cargo"), \
-             patch("bootstrap.install_system_deps", return_value=True), \
-             patch("bootstrap._run", return_value=True) as run, \
-             patch("bootstrap._tool_on_path", return_value=True):
-            bootstrap.build_fuse_ufs(force=True)
+        run = MagicMock(return_value=True)
+        self._install(run, force=True)
         assert "--force" in run.call_args[0][0]
 
     def test_cargo_failure_is_reported_not_raised(self):
-        with patch("bootstrap.tool_exists", return_value=False), \
-             patch("bootstrap._priv_prefix", return_value=[]), \
-             patch("bootstrap.find_cargo", return_value="/usr/bin/cargo"), \
-             patch("bootstrap.install_system_deps", return_value=True), \
-             patch("bootstrap._run", return_value=False):
-            assert bootstrap.build_fuse_ufs() is False
+        assert self._install(MagicMock(return_value=False)) is False
 
     def test_post_install_check_bypasses_the_tool_cache(self):
         """tool_exists memoises, so a pre-build miss would stick post-build."""
         with patch("bootstrap.tool_exists", return_value=False), \
              patch("bootstrap._priv_prefix", return_value=[]), \
              patch("bootstrap.find_cargo", return_value="/usr/bin/cargo"), \
+             patch("bootstrap.cargo_version", return_value=(1, 85)), \
              patch("bootstrap.install_system_deps", return_value=True), \
              patch("bootstrap._run", return_value=True), \
              patch("bootstrap._tool_on_path", return_value=True) as on_path:
             assert bootstrap.build_fuse_ufs() is True
         on_path.assert_called_once_with("fuse-ufs")
+
+
+class TestCargoVersion:
+    """Pick a release the toolchain can build instead of failing mid-compile."""
+
+    @staticmethod
+    def _cargo(stdout):
+        return MagicMock(stdout=stdout, returncode=0)
+
+    def test_parses_apt_cargo(self):
+        with patch("subprocess.run", return_value=self._cargo(
+                "cargo 1.75.0 (1d8b05cdd 2023-11-20)\n")):
+            assert bootstrap.cargo_version("/usr/bin/cargo") == (1, 75)
+
+    def test_parses_rustup_cargo(self):
+        with patch("subprocess.run", return_value=self._cargo(
+                "cargo 1.89.0 (c24e10642 2025-06-23)\n")):
+            assert bootstrap.cargo_version("/root/.cargo/bin/cargo") == (1, 89)
+
+    def test_unparseable_output_is_unknown(self):
+        with patch("subprocess.run", return_value=self._cargo("weird\n")):
+            assert bootstrap.cargo_version("/usr/bin/cargo") is None
+
+    def test_a_broken_cargo_is_unknown_not_an_exception(self):
+        with patch("subprocess.run", side_effect=OSError("boom")):
+            assert bootstrap.cargo_version("/usr/bin/cargo") is None
+
+    def test_apt_cargo_is_below_the_modern_threshold(self):
+        """Guards the constant itself: 1.75 must select the legacy pin."""
+        assert (1, 75) < bootstrap.FUSE_UFS_MODERN_RUST
+        assert (1, 85) >= bootstrap.FUSE_UFS_MODERN_RUST
 
 
 class TestBootstrapOptIn:

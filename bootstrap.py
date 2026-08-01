@@ -32,7 +32,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from utils import logger, tool_exists, SCRIPT_DIR
 
@@ -100,6 +100,18 @@ _SOURCE_BUILD_ROOT = Path("/var/lib/mountir/src")
 FUSE_UFS_CRATE = "fuse-ufs"
 FUSE_UFS_REPO = "https://github.com/asomers/fuse-ufs"
 FUSE_UFS_BUILD_DEPS = ["pkg-config", "libfuse3-dev", "gcc"]
+
+# The *current* fuse-ufs release pulls in dependencies built for the 2024 Rust
+# edition (fuser 0.16, bincode 2.x), which need Rust 1.85+. Ubuntu 24.04's apt
+# ``cargo`` is 1.75, so on a stock distro toolchain that build fails deep in the
+# dependency graph with an error naming a crate the user never asked for.
+#
+# 0.4.4 is the newest release whose dependency set still compiles on 1.75
+# (verified on Ubuntu 24.04 / cargo 1.75.0), so an older toolchain gets that
+# instead of a doomed build. Pinned deliberately: a forensic tool should install
+# a known-good version rather than whatever resolves today.
+FUSE_UFS_MODERN_RUST = (1, 85)
+FUSE_UFS_LEGACY_VERSION = "0.4.4"
 
 # cargo is usually installed per-user by rustup, and ``sudo`` resets PATH to
 # secure_path -- so the invoking user's cargo is invisible to a plain PATH
@@ -536,6 +548,23 @@ def find_cargo() -> Optional[str]:
     return None
 
 
+def cargo_version(cargo: str) -> Optional[Tuple[int, int]]:
+    """``(major, minor)`` reported by ``cargo --version``, or None.
+
+    Used to pick a fuse-ufs release this toolchain can actually build, rather
+    than starting a compile that dies minutes later inside a transitive crate.
+    """
+    try:
+        result = subprocess.run([cargo, "--version"], capture_output=True,
+                                text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"cargo\s+(\d+)\.(\d+)", result.stdout or "")
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 def build_fuse_ufs(force: bool = False) -> bool:
     """Install the ``fuse-ufs`` userspace UFS driver with cargo (opt-in).
 
@@ -577,11 +606,34 @@ def build_fuse_ufs(force: bool = False) -> bool:
 
     # --root /usr/local puts the binary in /usr/local/bin, matching where the
     # other source-built drivers land. --force lets a rebuild replace it.
-    cmd = prefix + [cargo, "install", FUSE_UFS_CRATE, "--root", "/usr/local"]
+    #
+    # --locked is not optional: without it cargo re-resolves the whole dependency
+    # graph to the newest semver-compatible releases, so an install that worked
+    # yesterday breaks the moment some transitive crate raises its MSRV. Locked
+    # installs the dependency set the author released and tested.
+    cmd = prefix + [cargo, "install", FUSE_UFS_CRATE, "--locked",
+                    "--root", "/usr/local"]
+
+    version = cargo_version(cargo)
+    if version and version < FUSE_UFS_MODERN_RUST:
+        logger.info(
+            "cargo %d.%d is older than the %d.%d the current fuse-ufs needs - "
+            "installing the pinned %s instead. For the latest, install a newer "
+            "toolchain with rustup (https://rustup.rs) and re-run with --force.",
+            version[0], version[1], FUSE_UFS_MODERN_RUST[0],
+            FUSE_UFS_MODERN_RUST[1], FUSE_UFS_LEGACY_VERSION,
+        )
+        cmd += ["--version", FUSE_UFS_LEGACY_VERSION]
+
     if force:
         cmd.append("--force")
     if not _run(cmd, timeout=1800):
-        logger.warning("cargo install %s failed", FUSE_UFS_CRATE)
+        logger.warning(
+            "cargo install %s failed. If it stopped on a dependency needing a "
+            "newer rustc, install an up-to-date toolchain with rustup "
+            "(https://rustup.rs) - Ubuntu's apt cargo lags well behind.",
+            FUSE_UFS_CRATE,
+        )
         return False
 
     if _tool_on_path("fuse-ufs"):
