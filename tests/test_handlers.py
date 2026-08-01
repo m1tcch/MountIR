@@ -192,7 +192,7 @@ class TestEwfBinaryResolution:
         with patch("handlers.ewf.bootstrap.best_ewfmount",
                    return_value="/usr/local/bin/ewfmount"), \
              patch("handlers.ewf.bootstrap.have_modern_libewf", return_value=True), \
-             patch("handlers.ewf.run_command") as rc:
+             patch("handlers.ewf.run_fuse_mount") as rc:
             result = EwfHandler().mount(image, mp)
 
         assert result.success is True
@@ -236,7 +236,7 @@ class TestEwfLogicalVsPhysical:
         with patch("handlers.ewf.bootstrap.best_ewfmount",
                    return_value="/usr/local/bin/ewfmount"), \
              patch("handlers.ewf.bootstrap.have_modern_libewf", return_value=True), \
-             patch("handlers.ewf.run_command") as rc:
+             patch("handlers.ewf.run_fuse_mount") as rc:
             result = EwfHandler().mount(image, mp)
 
         assert result.success is True
@@ -276,7 +276,7 @@ class TestEwfLogicalVsPhysical:
         with patch("handlers.ewf.bootstrap.best_ewfmount",
                    return_value="/usr/local/bin/ewfmount"), \
              patch("handlers.ewf.bootstrap.have_modern_libewf", return_value=True), \
-             patch("handlers.ewf.run_command") as rc:
+             patch("handlers.ewf.run_fuse_mount") as rc:
             result = EwfHandler().mount(image, mp)
 
         assert result.success is True

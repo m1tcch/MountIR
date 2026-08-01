@@ -10,7 +10,10 @@ from typing import List
 
 import bootstrap
 from handlers.base import BaseHandler, MountResult
-from utils import logger, run_command, fuse_unmount
+from utils import (
+    logger, run_command, fuse_unmount, run_fuse_mount,
+    FUSE_ACCESS_OPTS_LIBYAL,
+)
 
 # EWF version 2 containers (EnCase v7+); only a modern libewf can read these.
 _EWF2_SUFFIXES = (".ex01", ".lx01")
@@ -80,7 +83,7 @@ class EwfHandler(BaseHandler):
         cmd += [str(image_path), str(mount_point)]
 
         try:
-            run_command(cmd, capture=False)
+            run_fuse_mount(cmd, FUSE_ACCESS_OPTS_LIBYAL)
         except Exception as e:
             return MountResult(success=False, error=str(e))
 

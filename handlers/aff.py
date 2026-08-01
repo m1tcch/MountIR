@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import List
 
 from handlers.base import BaseHandler, MountResult
-from utils import logger, run_command, fuse_unmount
+from utils import (
+    logger, run_command, fuse_unmount, run_fuse_mount, FUSE_ACCESS_OPTS,
+)
 
 
 class AffHandler(BaseHandler):
@@ -30,7 +32,8 @@ class AffHandler(BaseHandler):
         <mount_point>/<image_name>.raw
         """
         try:
-            run_command(["affuse", str(image_path), str(mount_point)], capture=False)
+            run_fuse_mount(["affuse", str(image_path), str(mount_point)],
+                           FUSE_ACCESS_OPTS)
         except Exception as e:
             return MountResult(success=False, error=str(e))
 

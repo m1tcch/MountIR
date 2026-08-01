@@ -6,7 +6,8 @@ from typing import List
 
 from handlers.base import BaseHandler, MountResult
 from utils import (
-    logger, run_command, fuse_unmount,
+    logger, run_command, fuse_unmount, run_fuse_mount,
+    FUSE_ACCESS_OPTS_LIBYAL,
     ensure_nbd_module, find_free_nbd_device, nbd_connect, nbd_disconnect,
     tool_exists,
 )
@@ -64,7 +65,8 @@ class VmdkHandler(BaseHandler):
     def _mount_fuse(self, image_path: Path, mount_point: Path) -> MountResult:
         """Fallback: mount via vmdkmount (FUSE)."""
         try:
-            run_command(["vmdkmount", str(image_path), str(mount_point)], capture=False)
+            run_fuse_mount(["vmdkmount", str(image_path), str(mount_point)],
+                           FUSE_ACCESS_OPTS_LIBYAL)
         except Exception as e:
             return MountResult(success=False, error=str(e))
 

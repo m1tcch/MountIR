@@ -382,8 +382,12 @@ class TestFuseMounters:
         assert "ro" in ",".join(cmds[0])
 
     def test_vmfs_tries_both_generations(self):
-        bins = [c[0] for c in _fuse_mount_commands("vmfs", "/dev/loop3", Path("/mnt/x"))]
-        assert bins == ["vmfs-fuse", "vmfs6-fuse"]
+        """Each generation is tried, allow_other first then a plain fallback."""
+        cmds = _fuse_mount_commands("vmfs", "/dev/loop3", Path("/mnt/x"))
+        bins = [c[0] for c in cmds]
+        assert set(bins) == {"vmfs-fuse", "vmfs6-fuse"}
+        assert bins.index("vmfs-fuse") < bins.index("vmfs6-fuse")
+        assert "allow_other" in " ".join(cmds[0])
 
     def test_non_fuse_fs_has_no_binary_commands(self):
         assert _fuse_mount_commands("ext4", "/dev/loop3", Path("/mnt/x")) == []

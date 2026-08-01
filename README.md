@@ -87,6 +87,14 @@ above; tool availability varies by distro.
 
 - **Read-only by default** — forensic mount flags `ro,noatime,noexec,norecovery`
   applied per filesystem.
+- **Browsable without `sudo`** — mounts need root, but *reading* the evidence
+  afterwards shouldn't. A FUSE mount is visible only to the UID that created it
+  unless `allow_other` is set, so a root-made mount would make every `ls` need
+  `sudo` — and confusingly only on the FUSE-backed volumes, while the kernel
+  mounts beside them stayed readable. MountIR passes `allow_other` to every FUSE
+  driver it drives (`ewfmount`, `affuse`, `vmdkmount`, `vhdimount`, `apfs-fuse`,
+  `vmfs-fuse`, `fuse-ufs`), falling back to a root-only mount if a build refuses
+  the option rather than failing the mount.
 - **Batch / directory mounting** — point MountIR at several images, shell globs,
   or a whole folder and it mounts each one (skipping continuation segments and
   VMDK extents so multi-part sets mount once).

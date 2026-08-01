@@ -98,9 +98,17 @@ _SKIP_FILESYSTEMS = {
 # invoked as ``binary <extra-args> <device> <mount_point>``. These drivers have
 # no in-kernel equivalent on the platforms we target, so they are tried before
 # the generic ``mount`` attempts.
+# ``allow_other`` comes first in every list: a FUSE mount made by root is
+# otherwise invisible to the analyst's own shell, so browsing the evidence would
+# need sudo for every command. Each driver also gets a plain ``ro`` attempt after
+# it, because a build that rejects the option should still mount.
 _FUSE_MOUNTERS: Dict[str, List[Tuple[str, List[str]]]] = {
-    "apfs": [("apfs-fuse", ["-o", "ro,allow_other"])],
-    "vmfs": [("vmfs-fuse", ["-o", "ro"]), ("vmfs6-fuse", ["-o", "ro"])],
+    "apfs": [("apfs-fuse", ["-o", "ro,allow_other"]),
+             ("apfs-fuse", ["-o", "ro"])],
+    "vmfs": [("vmfs-fuse", ["-o", "ro,allow_other"]),
+             ("vmfs6-fuse", ["-o", "ro,allow_other"]),
+             ("vmfs-fuse", ["-o", "ro"]),
+             ("vmfs6-fuse", ["-o", "ro"])],
 }
 
 # Filesystems that normally mount through the *kernel* but have a FUSE driver to
@@ -114,7 +122,8 @@ _FUSE_MOUNTERS: Dict[str, List[Tuple[str, List[str]]]] = {
 # to load. ``fuse-ufs`` (github.com/asomers/fuse-ufs) then provides the only way
 # to mount UFS1/UFS2 on that host.
 _FUSE_FALLBACK_MOUNTERS: Dict[str, List[Tuple[str, List[str]]]] = {
-    "ufs": [("fuse-ufs", ["-o", "ro"])],
+    "ufs": [("fuse-ufs", ["-o", "ro,allow_other"]),
+            ("fuse-ufs", ["-o", "ro"])],
 }
 
 # GPT partition-type GUIDs that never contain a mountable filesystem. Matched by

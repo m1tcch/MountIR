@@ -369,6 +369,36 @@ def loop_devices_backing(base: Path, losetup_output: Optional[str] = None) -> Li
     return devices
 
 
+# A FUSE mount is visible only to the UID that created it unless ``allow_other``
+# is set. MountIR mounts as root, so without it the analyst's own shell gets
+# EACCES on the whole evidence tree and every ``ls`` needs sudo -- while kernel
+# mounts (vfat, ext4) in the same tree are readable, which makes the failure look
+# arbitrary. ntfs-3g and fuse-exfat set allow_other themselves when run as root;
+# ewfmount, affuse, vmdkmount, vhdimount, apfs-fuse and fuse-ufs do not.
+#
+# The libyal tools (ewfmount/vmdkmount/vhdimount) forward FUSE options with -X;
+# everything else uses the conventional -o.
+FUSE_ACCESS_OPTS_LIBYAL = ["-X", "allow_other"]
+FUSE_ACCESS_OPTS = ["-o", "allow_other"]
+
+
+def run_fuse_mount(cmd: List[str], access_opts: List[str],
+                   insert_at: int = 1, capture: bool = False):
+    """Run a FUSE mount command with ``allow_other``, retrying without it.
+
+    Not every build accepts the option (and a locked-down ``/etc/fuse.conf`` can
+    refuse it), so a rejection falls back to the plain command: a mount only root
+    can read still beats no mount at all. The retry is logged, not hidden.
+    """
+    with_access = cmd[:insert_at] + access_opts + cmd[insert_at:]
+    try:
+        return run_command(with_access, capture=capture)
+    except Exception as e:
+        logger.debug("FUSE mount with %s failed (%s); retrying without it",
+                     " ".join(access_opts), e)
+        return run_command(cmd, capture=capture)
+
+
 def fuse_unmount(mount_point: Path) -> bool:
     """Unmount a FUSE filesystem.
 
