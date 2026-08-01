@@ -255,23 +255,23 @@ class TestDriverAvailability:
     """Tell "this host has no driver" apart from "this volume is broken"."""
 
     def test_kernel_driver_present(self):
-        with patch("partition._kernel_filesystems", return_value={"ext4"}):
+        with patch("partition.kernel_filesystems", return_value={"ext4"}):
             assert _driver_available("ext4") is True
 
     def test_userspace_helper_counts_as_available(self):
         """ntfs-3g mounts NTFS with no 'ntfs' line in /proc/filesystems."""
-        with patch("partition._kernel_filesystems", return_value=set()), \
+        with patch("partition.kernel_filesystems", return_value=set()), \
              patch("partition.tool_exists", side_effect=lambda t: t == "ntfs-3g"):
             assert _driver_available("ntfs") is True
 
     def test_absent_driver_reported_once_modprobe_fails(self):
-        with patch("partition._kernel_filesystems", return_value={"ext4", "vfat"}), \
+        with patch("partition.kernel_filesystems", return_value={"ext4", "vfat"}), \
              patch("partition.tool_exists", return_value=False), \
              patch("partition.run_command", return_value=MagicMock(returncode=1)):
             assert _driver_available("ufs") is False
 
     def test_module_loaded_on_demand_counts_as_available(self):
-        with patch("partition._kernel_filesystems",
+        with patch("partition.kernel_filesystems",
                    side_effect=[{"ext4"}, {"ext4", "ufs"}]), \
              patch("partition.tool_exists", return_value=False), \
              patch("partition.run_command", return_value=MagicMock(returncode=0)):

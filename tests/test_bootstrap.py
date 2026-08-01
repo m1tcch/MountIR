@@ -119,7 +119,8 @@ class TestBuildApfsFuse:
              patch("bootstrap._priv_prefix", return_value=[]), \
              patch("bootstrap.install_system_deps", return_value=True), \
              patch("bootstrap._run", return_value=True) as run, \
-             patch("bootstrap.tool_exists", return_value=True):
+             patch("bootstrap.tool_exists", return_value=True), \
+             patch("bootstrap._tool_on_path", return_value=True):
             assert bootstrap.build_apfs_fuse(force=True) is True
 
         cmds = [c.args[0] for c in run.call_args_list]
@@ -130,12 +131,14 @@ class TestBuildApfsFuse:
 
     def test_build_completes_but_binary_absent(self, tmp_path):
         # _run succeeds but the binary never lands on PATH -> reported failure.
-        toolchk = iter([False])  # initial check skipped by force; final check False
+        # The final check must bypass tool_exists' cache, so it is _tool_on_path
+        # that decides here -- patched so the result can't depend on this host.
         with patch("bootstrap._SOURCE_BUILD_ROOT", tmp_path / "src"), \
              patch("bootstrap._priv_prefix", return_value=[]), \
              patch("bootstrap.install_system_deps", return_value=True), \
              patch("bootstrap._run", return_value=True), \
-             patch("bootstrap.tool_exists", return_value=False):
+             patch("bootstrap.tool_exists", return_value=False), \
+             patch("bootstrap._tool_on_path", return_value=False):
             assert bootstrap.build_apfs_fuse(force=True) is False
 
 

@@ -308,7 +308,7 @@ failure.
 | ext2/3/4, XFS, btrfs, vfat, ISO9660 | ✅ everywhere | – | |
 | NTFS | `ntfs3` (5.15+) | `ntfs-3g` | |
 | exFAT | `exfat` (5.4+) | `mount.exfat-fuse` | |
-| **UFS** *(FreeBSD, pfSense, NetScaler)* | `ufs` — **optional module** | `fuse-ufs` | see below |
+| **UFS** *(FreeBSD, pfSense, NetScaler)* | `ufs` — **optional module** | `fuse-ufs` | opt-in, see below |
 | APFS | – | `apfs-fuse` | built from source |
 | VMFS3/5/6 | – | `vmfs-fuse`, `vmfs6-fuse` | |
 
@@ -322,11 +322,27 @@ kernel that has it:
 sudo apt-get install linux-modules-extra-$(uname -r) && sudo modprobe ufs
 ```
 
-or install the userspace driver, which MountIR will use automatically:
+or install the userspace driver, which MountIR then uses automatically:
 
 ```bash
-cargo install fuse-ufs
+sudo mountir setup --with-fuse-ufs
 ```
+
+This is **opt-in** rather than part of the normal `mountir setup`, because
+[`fuse-ufs`](https://github.com/asomers/fuse-ufs) is a Rust crate and building
+it needs a cargo toolchain — too heavy a dependency to install unasked. MountIR
+uses the cargo you already have (including the one `sudo` hides in your own
+`~/.cargo/bin`) and installs the binary to `/usr/local/bin/fuse-ufs`. If no
+cargo is found it tells you so instead of installing a toolchain behind your
+back:
+
+```bash
+sudo apt-get install cargo        # or rustup, from https://rustup.rs
+sudo mountir setup --with-fuse-ufs
+```
+
+`mountir check` reports which provider each filesystem will actually use —
+`[kernel]` or the helper binary — so you can confirm UFS before you need it.
 
 ### Built from source
 
@@ -338,6 +354,11 @@ warns but never aborts setup:
 | --- | --- | --- |
 | `apfs-fuse` | [sgan81/apfs-fuse](https://github.com/sgan81/apfs-fuse) | read-only APFS (macOS) — no apt package exists |
 | `ewfmount` *(libewf)* | [libyal/libewf](https://github.com/libyal/libewf) | EWF v2 **Ex01/Lx01** — apt ships only the 2014 legacy line |
+| `fuse-ufs` † | [asomers/fuse-ufs](https://github.com/asomers/fuse-ufs) | UFS1/UFS2 on kernels without the `ufs` driver — **opt-in**, `mountir setup --with-fuse-ufs` |
+
+> **† `fuse-ufs` is opt-in.** It is a Rust crate, so it needs a cargo toolchain
+> — a heavy dependency to install unprompted. Plain `mountir setup` skips it and
+> just notes that UFS relies on the kernel driver.
 
 The from-source `ewfmount` lands in `/usr/local/bin` and shadows the apt one.
 The build links **FUSE** (via `libfuse-dev`) so `ewfmount` can actually *mount*,

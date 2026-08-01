@@ -86,6 +86,31 @@ APFS_FUSE_BUILD_DEPS = [
 ]
 _SOURCE_BUILD_ROOT = Path("/var/lib/mountir/src")
 
+# UFS (FreeBSD/pfSense/NetScaler) normally mounts through the in-kernel ``ufs``
+# driver, but that driver is optional: Ubuntu ships it in
+# linux-modules-extra-$(uname -r), and the Microsoft WSL2 kernel omits it
+# entirely while shipping no loadable modules at all. ``fuse-ufs`` is the
+# userspace driver that covers those hosts.
+#
+# It is a Rust crate, so building it needs a cargo toolchain. That is a heavy,
+# opinionated dependency to pull in behind the user's back, so this build is
+# **opt-in** (`mountir setup --with-fuse-ufs`) and never installs a toolchain
+# itself -- it uses cargo if cargo is already there and explains how to get one
+# if it isn't.
+FUSE_UFS_CRATE = "fuse-ufs"
+FUSE_UFS_REPO = "https://github.com/asomers/fuse-ufs"
+FUSE_UFS_BUILD_DEPS = ["pkg-config", "libfuse3-dev", "gcc"]
+
+# cargo is usually installed per-user by rustup, and ``sudo`` resets PATH to
+# secure_path -- so the invoking user's cargo is invisible to a plain PATH
+# lookup. Check the usual rustup locations for both root and $SUDO_USER.
+_CARGO_CANDIDATE_DIRS = [
+    "/usr/local/cargo/bin",
+    "/root/.cargo/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+]
+
 # The apt ``ewf-tools`` package ships the frozen 2014 *legacy* libewf line
 # (version 20140807), which cannot read EWF2 (Ex01/Lx01) EnCase v7 containers.
 # MountIR builds the maintained libyal release from source so a newer
@@ -461,10 +486,108 @@ def build_apfs_fuse(force: bool = False) -> bool:
         logger.warning("apfs-fuse build failed: %s", e)
         return False
 
-    if tool_exists("apfs-fuse"):
+    if _tool_on_path("apfs-fuse"):
         logger.info("apfs-fuse installed to /usr/local/bin")
         return True
     logger.warning("apfs-fuse build finished but the binary isn't on PATH")
+    return False
+
+
+def _tool_on_path(name: str) -> bool:
+    """PATH lookup that bypasses ``tool_exists``' cache.
+
+    ``tool_exists`` memoises its answer, so a tool probed *before* a build has
+    already been cached as missing and would still read as missing afterwards.
+    Post-install verification has to ask PATH again.
+    """
+    import shutil
+    return shutil.which(name) is not None
+
+
+def find_cargo() -> Optional[str]:
+    """Path to a usable ``cargo``, or None.
+
+    ``shutil.which`` alone isn't enough: rustup installs cargo into the user's
+    ``~/.cargo/bin``, and under ``sudo`` the reset ``secure_path`` hides it. We
+    also look under ``$SUDO_USER``'s home so ``sudo mountir setup`` finds the
+    toolchain the user actually installed.
+    """
+    import shutil
+
+    found = shutil.which("cargo")
+    if found:
+        return found
+
+    # $SUDO_USER first: under sudo, $HOME is usually /root, while the toolchain
+    # the user actually installed lives in their own home.
+    candidates: List[str] = []
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        candidates.append(f"/home/{sudo_user}/.cargo/bin")
+    home = os.environ.get("HOME")
+    if home:
+        candidates.append(str(Path(home) / ".cargo" / "bin"))
+    candidates.extend(_CARGO_CANDIDATE_DIRS)
+
+    for directory in candidates:
+        candidate = Path(directory) / "cargo"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def build_fuse_ufs(force: bool = False) -> bool:
+    """Install the ``fuse-ufs`` userspace UFS driver with cargo (opt-in).
+
+    Gives FreeBSD/pfSense/NetScaler UFS volumes a driver on hosts whose kernel
+    has none -- notably WSL2, which ships neither the ``ufs`` module nor any way
+    to load one. Installs into ``/usr/local`` so the binary lands in
+    ``/usr/local/bin/fuse-ufs``, where :mod:`partition` picks it up
+    automatically as the UFS fallback mounter.
+
+    Best-effort and never raises. Returns True only when a ``fuse-ufs`` binary
+    ends up on PATH. A missing cargo is reported with how to get one rather than
+    installing a Rust toolchain unprompted.
+    """
+    if not force and tool_exists("fuse-ufs"):
+        logger.debug("fuse-ufs already installed")
+        return True
+
+    prefix = _priv_prefix()
+    if prefix is None:
+        logger.error(
+            "Cannot install fuse-ufs without root. Run as root/sudo, or install "
+            "it yourself with 'cargo install %s'", FUSE_UFS_CRATE,
+        )
+        return False
+
+    cargo = find_cargo()
+    if not cargo:
+        logger.warning(
+            "fuse-ufs needs a Rust toolchain and no 'cargo' was found. Install "
+            "one (apt install cargo, or rustup from https://rustup.rs) and "
+            "re-run 'mountir setup --with-fuse-ufs'. Source: %s", FUSE_UFS_REPO,
+        )
+        return False
+
+    logger.info("Installing fuse-ufs with %s (userspace UFS driver)", cargo)
+    if not install_system_deps(FUSE_UFS_BUILD_DEPS):
+        logger.warning("Could not install fuse-ufs build dependencies")
+        return False
+
+    # --root /usr/local puts the binary in /usr/local/bin, matching where the
+    # other source-built drivers land. --force lets a rebuild replace it.
+    cmd = prefix + [cargo, "install", FUSE_UFS_CRATE, "--root", "/usr/local"]
+    if force:
+        cmd.append("--force")
+    if not _run(cmd, timeout=1800):
+        logger.warning("cargo install %s failed", FUSE_UFS_CRATE)
+        return False
+
+    if _tool_on_path("fuse-ufs"):
+        logger.info("fuse-ufs installed to /usr/local/bin")
+        return True
+    logger.warning("cargo reported success but fuse-ufs isn't on PATH")
     return False
 
 
@@ -799,12 +922,16 @@ def ensure_system_bootstrap() -> None:
     _write_marker()
 
 
-def run_bootstrap(force: bool = False) -> bool:
+def run_bootstrap(force: bool = False, with_fuse_ufs: bool = False) -> bool:
     """Full dependency install for ``mountir setup``.
 
     Creates/refreshes the venv with the pinned Python deps and installs any
     missing system forensic tools.  Does not re-exec (the caller is performing
     setup, not a mount operation).
+
+    *with_fuse_ufs* additionally installs the ``fuse-ufs`` UFS driver via cargo.
+    It is opt-in because it needs a Rust toolchain, which is too heavy a
+    dependency to pull in unasked -- see :func:`build_fuse_ufs`.
     """
     logger.info("Bootstrapping MountIR dependencies...")
     venv_ok = ensure_venv_ready(force_install=True)
@@ -827,6 +954,19 @@ def run_bootstrap(force: bool = False) -> bool:
             "Modern libewf is unavailable - EnCase v7 EWF2 (Ex01/Lx01) images "
             "won't mount until it builds (needs a compiler + network). Re-run "
             "'mountir setup' to retry.")
+
+    # UFS: opt-in, because it needs a Rust toolchain. Skipping it only costs
+    # UFS support, and only on hosts whose kernel lacks the ufs driver.
+    if with_fuse_ufs:
+        if not build_fuse_ufs(force=force):
+            logger.warning(
+                "fuse-ufs is unavailable - FreeBSD/pfSense/NetScaler UFS volumes "
+                "won't mount on a kernel without the 'ufs' driver. Re-run "
+                "'mountir setup --with-fuse-ufs' once cargo is installed.")
+    elif not _tool_on_path("fuse-ufs"):
+        logger.info(
+            "UFS uses the in-kernel driver. If this kernel lacks it (WSL2 does), "
+            "add the userspace driver with 'mountir setup --with-fuse-ufs'.")
 
     _write_marker()
 

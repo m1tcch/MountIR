@@ -918,7 +918,7 @@ def _best_mount_error(errors: List[str]) -> str:
     return min(errors, key=_error_rank)
 
 
-def _kernel_filesystems() -> Set[str]:
+def kernel_filesystems() -> Set[str]:
     """Filesystem drivers the running kernel can mount, from /proc/filesystems."""
     try:
         text = Path("/proc/filesystems").read_text(encoding="utf-8")
@@ -944,9 +944,10 @@ _FS_PROVIDERS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
 
 # Remediation for a filesystem this host has no driver for at all.
 _NO_DRIVER_HINTS: Dict[str, str] = {
-    "ufs": "install fuse-ufs (cargo install fuse-ufs), or boot a kernel built "
-           "with CONFIG_UFS_FS (linux-modules-extra-$(uname -r) on Ubuntu); "
-           "the Microsoft WSL2 kernel ships neither",
+    "ufs": "install the userspace driver with 'mountir setup --with-fuse-ufs' "
+           "(needs cargo), or boot a kernel built with CONFIG_UFS_FS "
+           "(linux-modules-extra-$(uname -r) on Ubuntu); the Microsoft WSL2 "
+           "kernel ships neither",
     "exfat": "install exfat-fuse/exfatprogs (mountir setup), or use a 5.4+ "
              "kernel built with CONFIG_EXFAT_FS",
     "apfs": "install apfs-fuse (mountir setup)",
@@ -970,7 +971,7 @@ def _driver_available(fstype: str) -> bool:
     if any(tool_exists(helper) for helper in helpers):
         return True
 
-    available = _kernel_filesystems()
+    available = kernel_filesystems()
     if any(name in available for name in kernel_names):
         return True
 
@@ -979,7 +980,7 @@ def _driver_available(fstype: str) -> bool:
             result = run_command(["modprobe", name], check=False, timeout=30)
         except Exception:
             continue
-        if result.returncode == 0 and name in _kernel_filesystems():
+        if result.returncode == 0 and name in kernel_filesystems():
             logger.info("Loaded kernel module '%s' for %s", name, fstype)
             return True
     return False

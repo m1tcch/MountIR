@@ -40,7 +40,7 @@ from handlers.base import MountResult
 from partition import (
     expose_partitions, mount_partition, unmount_partitions,
     detect_lvm, activate_lvm, deactivate_lvm,
-    infer_os, PartitionInfo, _enrich_with_blkid,
+    infer_os, kernel_filesystems, PartitionInfo, _enrich_with_blkid,
 )
 from state import StateManager, MountedImage, MountedPartition
 import zfs
@@ -778,18 +778,36 @@ def cmd_check(args):
         ("file", "file (built-in)", "Image type detection"),
     ]
 
-    # Filesystem drivers: (label, probe-tool-or-None, install hint, description).
-    # A None tool means the in-kernel driver is used (nothing to install).
+    # Filesystem drivers: (label, helper-binary-or-None, install hint,
+    # description, in-kernel type name or None). A filesystem is available when
+    # the kernel provides it *or* its userspace helper is installed, so both are
+    # checked -- reporting "builtin" for a driver this kernel doesn't actually
+    # have (WSL2 has no ufs) is worse than reporting nothing.
+    kernel_fs = kernel_filesystems()
     fs_drivers = [
-        ("NTFS", "ntfs-3g", "ntfs-3g", "Windows volumes"),
-        ("exFAT", "mount.exfat-fuse", "exfat-fuse", "exFAT (kernel 5.4+ also works)"),
-        ("HFS+", "fsck.hfsplus", "hfsprogs", "macOS legacy volumes"),
-        ("APFS", "apfs-fuse", "built from source: mountir setup", "macOS APFS volumes"),
-        ("VMFS3/5", "vmfs-fuse", "vmfs-tools", "VMware ESXi 5.x datastores"),
-        ("VMFS6", "vmfs6-fuse", "vmfs6-tools", "VMware ESXi 6.5+ datastores"),
-        ("ZFS", "zpool", "zfsutils-linux", "ZFS pools (also needs kernel module)"),
-        ("UFS", None, "kernel driver", "FreeBSD/NetScaler/pfSense"),
+        ("NTFS", "ntfs-3g", "ntfs-3g", "Windows volumes", "ntfs3"),
+        ("exFAT", "mount.exfat-fuse", "exfat-fuse",
+         "exFAT (kernel 5.4+ also works)", "exfat"),
+        ("HFS+", "fsck.hfsplus", "hfsprogs", "macOS legacy volumes", "hfsplus"),
+        ("APFS", "apfs-fuse", "built from source: mountir setup",
+         "macOS APFS volumes", None),
+        ("VMFS3/5", "vmfs-fuse", "vmfs-tools", "VMware ESXi 5.x datastores", None),
+        ("VMFS6", "vmfs6-fuse", "vmfs6-tools", "VMware ESXi 6.5+ datastores", None),
+        ("ZFS", "zpool", "zfsutils-linux",
+         "ZFS pools (also needs kernel module)", None),
+        ("UFS", "fuse-ufs", "mountir setup --with-fuse-ufs",
+         "FreeBSD/NetScaler/pfSense", "ufs"),
+        ("ext2/3/4, XFS, btrfs, vfat", None, "built in", "Linux/Windows volumes",
+         "ext4"),
     ]
+
+    def _driver_status(tool, kernel_name):
+        """(available, provider) for one filesystem-driver row."""
+        if kernel_name and kernel_name in kernel_fs:
+            return True, "kernel"
+        if tool and tool_exists(tool):
+            return True, tool
+        return False, ""
 
     if getattr(args, "json", False):
         output = {"format_handlers": {}, "support_tools": {},
@@ -800,10 +818,11 @@ def cmd_check(args):
             }
         for tool, pkg, desc in support_tools:
             output["support_tools"][tool] = tool_exists(tool)
-        for label, tool, hint, desc in fs_drivers:
-            output["filesystem_drivers"][label] = (
-                True if tool is None else tool_exists(tool)
-            )
+        for label, tool, hint, desc, kernel_name in fs_drivers:
+            available, provider = _driver_status(tool, kernel_name)
+            output["filesystem_drivers"][label] = {
+                "available": available, "provider": provider,
+            }
         output["ewfmount_version"] = bootstrap.installed_ewfmount_version()
         output["ewfmount_modern"] = bootstrap.have_modern_libewf()
         output["ewfmount_fuse"] = bootstrap.ewfmount_has_fuse()
@@ -864,18 +883,20 @@ def cmd_check(args):
             print(f"  {'':14} Install: sudo apt install {pkg}", file=sys.stderr)
 
     print(f"\n{_h('Filesystem Drivers:')}", file=sys.stderr)
-    for label, tool, hint, desc in fs_drivers:
-        if tool is None:
-            print(f"  {label:<14} {_ok('builtin'):<10} {desc}", file=sys.stderr)
+    for label, tool, hint, desc, kernel_name in fs_drivers:
+        available, provider = _driver_status(tool, kernel_name)
+        status = _ok("OK") if available else _miss("MISSING")
+        via = f" [{provider}]" if provider else ""
+        print(f"  {label:<26} {status:<10} {desc}{via}", file=sys.stderr)
+        if available:
             continue
-        exists = tool_exists(tool)
-        status = _ok("OK") if exists else _miss("MISSING")
-        print(f"  {label:<14} {status:<10} {desc} ({tool})", file=sys.stderr)
-        if not exists:
-            if hint.startswith("built from source"):
-                print(f"  {'':14} {hint}", file=sys.stderr)
-            else:
-                print(f"  {'':14} Install: sudo apt install {hint}", file=sys.stderr)
+        if hint.startswith(("built from source", "mountir ")):
+            print(f"  {'':26} {hint}", file=sys.stderr)
+        else:
+            print(f"  {'':26} Install: sudo apt install {hint}", file=sys.stderr)
+        if kernel_name:
+            print(f"  {'':26} (or a kernel providing '{kernel_name}')",
+                  file=sys.stderr)
 
     print(f"\n  Run 'mountir setup' to install everything automatically.\n",
           file=sys.stderr)
@@ -982,13 +1003,17 @@ def cmd_setup(args):
 
     ``--force`` rebuilds the source-built tools (apfs-fuse, libewf) even when
     already present; without it an existing modern libewf/apfs-fuse is reused.
+    ``--with-fuse-ufs`` additionally installs the cargo-built UFS driver.
     """
-    bootstrap.run_bootstrap(force=getattr(args, "force", False))
+    bootstrap.run_bootstrap(
+        force=getattr(args, "force", False),
+        with_fuse_ufs=getattr(args, "with_fuse_ufs", False),
+    )
 
 
 def cmd_install_deps(args):
     """Backwards-compatible alias for 'setup' (installs system tools)."""
-    bootstrap.run_bootstrap(force=getattr(args, "force", False))
+    cmd_setup(args)
 
 
 # ---------------------------------------------------------------------------
@@ -1109,12 +1134,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rebuild source-built tools (apfs-fuse, libewf) even if already "
              "present; set MOUNTIR_LIBEWF_VERSION to pull a newer libewf",
     )
+    setup_parser.add_argument(
+        "--with-fuse-ufs", action="store_true",
+        help="Also install the fuse-ufs UFS driver via cargo (needs a Rust "
+             "toolchain). Required for FreeBSD/pfSense/NetScaler UFS volumes on "
+             "kernels without the 'ufs' driver, such as WSL2",
+    )
 
     # --- install-deps (legacy alias for setup) ---
     install_parser = subparsers.add_parser(
         "install-deps", help="Alias for 'setup' (install system forensic tools)",
     )
     install_parser.add_argument("-v", "--verbose", action="store_true")
+    install_parser.add_argument("--force", action="store_true",
+                                help="Rebuild source-built tools")
+    install_parser.add_argument(
+        "--with-fuse-ufs", action="store_true",
+        help="Also install the fuse-ufs UFS driver via cargo",
+    )
 
     return parser
 
