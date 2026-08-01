@@ -27,12 +27,13 @@ offset + size) is read straight from the partition table with
 
 import re
 import stat
+import struct
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
-from utils import logger, run_command, ensure_mount_dir
+from utils import logger, run_command, ensure_mount_dir, tool_exists
 
 # partx/sfdisk report partition START in 512-byte units regardless of the
 # drive's logical sector size; sfdisk additionally prints an explicit
@@ -62,6 +63,9 @@ class PartitionInfo:
     mounted: bool = False
     mount_error: Optional[str] = None
     backing_loop: str = ""  # offset loop device we created (for cleanup)
+    skip_reason: str = ""   # why this partition is deliberately not mounted
+    fs_claimed_bytes: int = 0   # size the filesystem's own superblock claims
+    window_bytes: int = 0       # bytes actually exposed (differs when widened)
 
 
 # Forensic mount options per filesystem type
@@ -97,6 +101,47 @@ _SKIP_FILESYSTEMS = {
 _FUSE_MOUNTERS: Dict[str, List[Tuple[str, List[str]]]] = {
     "apfs": [("apfs-fuse", ["-o", "ro,allow_other"])],
     "vmfs": [("vmfs-fuse", ["-o", "ro"]), ("vmfs6-fuse", ["-o", "ro"])],
+}
+
+# Filesystems that normally mount through the *kernel* but have a FUSE driver to
+# fall back on when the kernel wasn't built with the driver. Unlike
+# :data:`_FUSE_MOUNTERS` these are tried *after* the ``mount`` attempts, because
+# the in-kernel driver is faster and better tested when it is present.
+#
+# ``ufs`` (FreeBSD/NetScaler/pfSense) is the case that matters in practice: many
+# stock kernels ship the ufs driver only in an optional modules package, and
+# some -- notably the Microsoft WSL2 kernel -- omit it entirely, with no module
+# to load. ``fuse-ufs`` (github.com/asomers/fuse-ufs) then provides the only way
+# to mount UFS1/UFS2 on that host.
+_FUSE_FALLBACK_MOUNTERS: Dict[str, List[Tuple[str, List[str]]]] = {
+    "ufs": [("fuse-ufs", ["-o", "ro"])],
+}
+
+# GPT partition-type GUIDs that never contain a mountable filesystem. Matched by
+# *prefix* so vendor variants of the trailing node are still recognised: real
+# FreeBSD release images carry freebsd-boot as
+# ``83bd6b9d-7f41-11dc-be0b-001560b84f0f`` rather than the canonical
+# ``...-001e4f32e6b9``, and an exact-match table would miss it.
+_NON_FS_GPT_TYPES: List[Tuple[str, str]] = [
+    ("83bd6b9d-7f41-11dc-be0b-", "freebsd-boot (bootcode)"),
+    ("516e7cb5-6ecf-11d6-8ff8-", "freebsd-swap"),
+    ("516e7cb8-6ecf-11d6-8ff8-", "freebsd-vinum (volume manager)"),
+    ("21686148-6449-6e6f-744e-656564454649", "BIOS boot partition"),
+    ("0657fd6d-a4ab-43c4-84e5-0933c84b4f4f", "Linux swap"),
+    ("e3c9e316-0b5c-4db8-817d-f92df00215ae", "Microsoft Reserved (MSR)"),
+    ("6a82cb45-1dd2-11b2-99a6-080020736631", "Solaris boot"),
+    ("6a87c46f-1dd2-11b2-99a6-080020736631", "Solaris swap"),
+    ("824cc7a0-36a8-11e3-890a-952519ad3f61", "OpenBSD swap"),
+    ("49f48d32-b10e-11dc-b99b-0019d1879648", "NetBSD swap"),
+]
+
+# MBR partition-type codes that never contain a mountable filesystem.
+_NON_FS_MBR_TYPES: Dict[int, str] = {
+    0x05: "extended partition (container)",
+    0x0F: "extended partition (LBA container)",
+    0x82: "Linux swap",
+    0x85: "Linux extended partition (container)",
+    0xEE: "GPT protective MBR entry",
 }
 
 # file(1) magic substring (lowercase) -> filesystem type. Last-resort detection
@@ -362,6 +407,189 @@ def _geometry_ok(p: PartitionInfo, disk_size: int) -> bool:
     return True
 
 
+def _nonfs_partition_kind(part: PartitionInfo) -> str:
+    """Name the partition role when its table entry says "not a filesystem".
+
+    A ``freebsd-boot`` slice holds raw bootcode and a ``freebsd-swap`` slice
+    holds swap; neither has a superblock, so probing them yields nothing and
+    mounting them can only fail. Reporting those as mount *failures* buries the
+    one partition that genuinely didn't mount, so we classify them from the
+    partition table instead and skip them deliberately.
+
+    Returns a human-readable role (e.g. ``"freebsd-swap"``) or ``""`` when the
+    entry is an ordinary data partition.
+    """
+    hint = (part.type_hint or "").strip().strip('"').lower()
+    if not hint:
+        return ""
+
+    if "-" in hint:  # GPT type GUID
+        for prefix, label in _NON_FS_GPT_TYPES:
+            if hint.startswith(prefix):
+                return label
+        return ""
+
+    try:  # MBR type code, reported as "0x83" by partx and "83" by sfdisk
+        code = int(hint, 16)
+    except ValueError:
+        return ""
+    return _NON_FS_MBR_TYPES.get(code, "")
+
+
+# ---------------------------------------------------------------------------
+# Filesystem extent (superblock) probing
+# ---------------------------------------------------------------------------
+def _read_at(device: str, offset: int, length: int) -> bytes:
+    """Read *length* bytes at *offset* from a device/file (b"" on any error)."""
+    try:
+        with open(device, "rb") as fh:
+            fh.seek(offset)
+            return fh.read(length)
+    except OSError as e:
+        logger.debug("raw read failed on %s at %d: %s", device, offset, e)
+        return b""
+
+
+def _ext_claimed_size(device: str) -> int:
+    sb = _read_at(device, 1024, 1024)
+    if len(sb) < 1024 or struct.unpack_from("<H", sb, 56)[0] != 0xEF53:
+        return 0
+    block_size = 1024 << struct.unpack_from("<I", sb, 24)[0]
+    blocks = struct.unpack_from("<I", sb, 4)[0]
+    if struct.unpack_from("<I", sb, 96)[0] & 0x80:  # INCOMPAT_64BIT
+        blocks |= struct.unpack_from("<I", sb, 0x150)[0] << 32
+    return blocks * block_size
+
+
+def _btrfs_claimed_size(device: str) -> int:
+    sb = _read_at(device, 65536, 4096)
+    if len(sb) < 4096 or sb[64:72] != b"_BHRfS_M":
+        return 0
+    # dev_item.total_bytes is what the kernel compares against the block device;
+    # super.total_bytes is the sum across all devices of a multi-device pool.
+    dev_total = struct.unpack_from("<Q", sb, 0xD1)[0]
+    return dev_total or struct.unpack_from("<Q", sb, 0x70)[0]
+
+
+def _xfs_claimed_size(device: str) -> int:
+    sb = _read_at(device, 0, 512)
+    if len(sb) < 512 or sb[:4] != b"XFSB":
+        return 0
+    block_size = struct.unpack_from(">I", sb, 4)[0]
+    return struct.unpack_from(">Q", sb, 8)[0] * block_size
+
+
+def _exfat_claimed_size(device: str) -> int:
+    sb = _read_at(device, 0, 512)
+    if len(sb) < 512 or sb[3:11] != b"EXFAT   ":
+        return 0
+    return struct.unpack_from("<Q", sb, 72)[0] << sb[108]
+
+
+def _ntfs_claimed_size(device: str) -> int:
+    sb = _read_at(device, 0, 512)
+    if len(sb) < 512 or sb[3:11] != b"NTFS    ":
+        return 0
+    bytes_per_sector = struct.unpack_from("<H", sb, 11)[0]
+    # total_sectors excludes the backup boot sector that lives one sector past
+    # the end, which the driver still requires to be readable.
+    return (struct.unpack_from("<Q", sb, 40)[0] + 1) * bytes_per_sector
+
+
+_FS_SIZE_PROBES = {
+    "ext2": _ext_claimed_size,
+    "ext3": _ext_claimed_size,
+    "ext4": _ext_claimed_size,
+    "btrfs": _btrfs_claimed_size,
+    "xfs": _xfs_claimed_size,
+    "exfat": _exfat_claimed_size,
+    "ntfs": _ntfs_claimed_size,
+}
+
+
+def _fs_claimed_size(device: str, fstype: str) -> int:
+    """Bytes the filesystem's own superblock says it occupies (0 if unknown).
+
+    Only the filesystems whose drivers hard-fail when the block device is
+    shorter than the superblock claims are probed; for the rest the answer
+    wouldn't change what we do. When blkid named no type at all we sweep every
+    probe -- each is magic-checked, so a miss costs a read and nothing else.
+    """
+    if fstype:
+        probe = _FS_SIZE_PROBES.get(fstype)
+        probes = [probe] if probe else []
+    else:
+        probes = list(_FS_SIZE_PROBES.values())
+    for probe in probes:
+        try:
+            size = probe(device)
+        except Exception:
+            continue
+        if size > 0:
+            return size
+    return 0
+
+
+def _detach_loop(device: str) -> None:
+    """Detach a loop device we created, ignoring failures."""
+    try:
+        run_command(["losetup", "--detach", device], check=False, timeout=15)
+    except Exception as e:
+        logger.debug("could not detach %s: %s", device, e)
+
+
+def _widen_to_filesystem(part: PartitionInfo, backing: str, disk_size: int,
+                         created: List[str]) -> None:
+    """Re-expose *part* over the full extent its filesystem claims.
+
+    A partition entry can be *shorter* than the filesystem living inside it --
+    a table rebuilt by a recovery tool, a partition shrunk without shrinking the
+    filesystem, or an image whose volumes were laid down over each other. Every
+    modern driver validates its superblock against the block device length and
+    refuses the mount outright (ext4 "block count exceeds size of device", btrfs
+    "device total_bytes should be at most ...", fuse-exfat "file system is
+    larger than underlying device"), so honouring the too-small table entry
+    guarantees a failure on data that is perfectly readable.
+
+    We therefore widen the window to the filesystem's own claimed extent (capped
+    at the end of the media) and mount that read-only. The widened window can
+    overlap neighbouring partitions, so it is logged loudly -- the analyst needs
+    to know the exposed range no longer matches the partition table.
+    """
+    claimed = _fs_claimed_size(part.device, part.filesystem)
+    part.fs_claimed_bytes = claimed
+    if claimed <= part.size_bytes:
+        return
+
+    available = (disk_size - part.start_bytes) if disk_size > 0 else claimed
+    window = min(claimed, available) if available > 0 else claimed
+    if window <= part.size_bytes:
+        return
+
+    logger.warning(
+        "Partition %d: the %s filesystem claims %d bytes but its partition "
+        "table entry is only %d bytes - re-exposing %d bytes from offset %d so "
+        "it can be read (the window overlaps neighbouring partitions)",
+        part.number, part.filesystem or "detected", claimed, part.size_bytes,
+        window, part.start_bytes,
+    )
+
+    loop = _attach_offset_loop(backing, part.start_bytes, window)
+    if not loop:
+        logger.warning("Partition %d: could not widen the exposure window",
+                       part.number)
+        return
+
+    if part.backing_loop:
+        _detach_loop(part.backing_loop)
+        if part.backing_loop in created:
+            created.remove(part.backing_loop)
+    part.device = loop
+    part.backing_loop = loop
+    part.window_bytes = window
+    created.append(loop)
+
+
 def _whole_volume_fs(backing: str) -> Tuple[str, str]:
     """Detect a filesystem occupying the *whole* backing (a single-volume image).
 
@@ -493,7 +721,13 @@ def expose_partitions(backing: Union[str, Path],
             logger.debug("Exposed partition %d -> %s (offset=%d, size=%d)",
                          p.number, loop, p.start_bytes, p.size_bytes)
         p.device = device
+        p.window_bytes = p.size_bytes
         _enrich_with_blkid(p)
+        _widen_to_filesystem(p, backing, disk_size, created)
+        if not p.filesystem:
+            # No superblock found: believe the partition table when it says this
+            # entry holds bootcode/swap rather than reporting a mount failure.
+            p.skip_reason = _nonfs_partition_kind(p)
 
     return valid, created
 
@@ -617,14 +851,167 @@ def _enrich_with_blkid(part: PartitionInfo) -> None:
 # ---------------------------------------------------------------------------
 # Mounting
 # ---------------------------------------------------------------------------
+# mount(8) pads a real diagnosis with boilerplate. The pointer to dmesg is a
+# line of its own and comes *last*, so taking the final line (as this used to)
+# threw the diagnosis away and reported the advice.
+_MOUNT_NOISE_LINE = "dmesg(1) may have more information after failed mount system call."
+
+# The "missing codepage" clause is appended to the diagnosis line itself rather
+# than printed separately, so it is trimmed off the end instead of skipped.
+_MOUNT_TRAILING_NOISE_RE = re.compile(
+    r",?\s*missing codepage or helper program, or other error\.?\s*$", re.IGNORECASE)
+
+# The catch-all mount(8) failure. It means "the driver rejected the superblock"
+# without saying why, so it must never mask a more specific message from another
+# attempt -- and it is the cue to go look in the kernel ring buffer.
+_GENERIC_MOUNT_ERROR = "wrong fs type, bad option, bad superblock"
+
+_MOUNT_PREFIX_RE = re.compile(r"^mount(\.\S+)?:\s*(/\S*:\s*)?", re.IGNORECASE)
+
+
 def _short_mount_error(e: Exception) -> str:
-    """Pull a concise message out of a failed mount command."""
-    if isinstance(e, subprocess.CalledProcessError):
-        stderr = (e.stderr or "").strip()
-        if stderr:
-            return stderr.splitlines()[-1].strip()
-        return f"mount exited with code {e.returncode}"
-    return str(e)
+    """Pull the concise *diagnosis* out of a failed mount command.
+
+    ``mount`` prints the reason first and generic advice afterwards::
+
+        mount: /mnt/p2: wrong fs type, bad option, bad superblock on /dev/loop5p2,
+               missing codepage or helper program, or other error.
+               dmesg(1) may have more information after failed mount system call.
+
+    so the useful text is the first non-boilerplate line, with the
+    ``mount: <mountpoint>:`` prefix stripped.
+    """
+    if not isinstance(e, subprocess.CalledProcessError):
+        return str(e)
+
+    for line in (e.stderr or "").splitlines():
+        line = line.strip()
+        if not line or _MOUNT_NOISE_LINE in line:
+            continue
+        line = _MOUNT_PREFIX_RE.sub("", line, count=1)
+        line = _MOUNT_TRAILING_NOISE_RE.sub("", line).strip().rstrip(".")
+        if line:
+            return line
+    return f"mount exited with code {e.returncode}"
+
+
+def _error_rank(message: str) -> int:
+    """Rank a mount error by how much it explains (lower is more informative).
+
+    Every attempt list ends with an auto-detect mount, whose catch-all error
+    would otherwise overwrite the specific reason reported by the attempt that
+    used the detected filesystem type.
+    """
+    if not message:
+        return 3
+    if _GENERIC_MOUNT_ERROR in message:
+        return 2
+    if "unknown filesystem type" in message:
+        return 1
+    return 0
+
+
+def _best_mount_error(errors: List[str]) -> str:
+    """Pick the most informative message from a run of failed attempts."""
+    if not errors:
+        return "unknown filesystem type"
+    return min(errors, key=_error_rank)
+
+
+def _kernel_filesystems() -> Set[str]:
+    """Filesystem drivers the running kernel can mount, from /proc/filesystems."""
+    try:
+        text = Path("/proc/filesystems").read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    return {line.split()[-1] for line in text.splitlines() if line.strip()}
+
+
+# What can actually mount a given filesystem: (in-kernel type names, helper
+# binaries). A filesystem whose driver is provided entirely in userspace has no
+# entry in /proc/filesystems, so checking the kernel alone would wrongly declare
+# NTFS or APFS unsupported on a host where the FUSE helper is installed.
+_FS_PROVIDERS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    "ntfs":    (("ntfs3", "ntfs"), ("ntfs-3g", "mount.ntfs-3g")),
+    "exfat":   (("exfat",), ("mount.exfat", "mount.exfat-fuse")),
+    "ufs":     (("ufs",), ("fuse-ufs",)),
+    "hfsplus": (("hfsplus", "hfs"), ()),
+    "apfs":    ((), ("apfs-fuse",)),
+    "vmfs":    ((), ("vmfs-fuse", "vmfs6-fuse")),
+    "fat32":   (("vfat", "msdos"), ()),
+    "fat16":   (("vfat", "msdos"), ()),
+}
+
+# Remediation for a filesystem this host has no driver for at all.
+_NO_DRIVER_HINTS: Dict[str, str] = {
+    "ufs": "install fuse-ufs (cargo install fuse-ufs), or boot a kernel built "
+           "with CONFIG_UFS_FS (linux-modules-extra-$(uname -r) on Ubuntu); "
+           "the Microsoft WSL2 kernel ships neither",
+    "exfat": "install exfat-fuse/exfatprogs (mountir setup), or use a 5.4+ "
+             "kernel built with CONFIG_EXFAT_FS",
+    "apfs": "install apfs-fuse (mountir setup)",
+    "vmfs": "install vmfs-tools / vmfs6-tools",
+    "zfs": "install zfsutils-linux and load the zfs kernel module",
+}
+
+
+def _driver_available(fstype: str) -> bool:
+    """True when this host can mount *fstype* at all, loading a module if needed.
+
+    Distros commonly ship the ufs/exfat drivers in an optional modules package
+    that isn't loaded until first use, so a missing entry in /proc/filesystems
+    is only conclusive after ``modprobe`` has had a turn. Calling this *before*
+    mounting means such a host mounts on the first attempt rather than reporting
+    a spurious failure.
+    """
+    if not fstype:
+        return True
+    kernel_names, helpers = _FS_PROVIDERS.get(fstype, ((fstype,), ()))
+    if any(tool_exists(helper) for helper in helpers):
+        return True
+
+    available = _kernel_filesystems()
+    if any(name in available for name in kernel_names):
+        return True
+
+    for name in kernel_names:
+        try:
+            result = run_command(["modprobe", name], check=False, timeout=30)
+        except Exception:
+            continue
+        if result.returncode == 0 and name in _kernel_filesystems():
+            logger.info("Loaded kernel module '%s' for %s", name, fstype)
+            return True
+    return False
+
+
+def _no_driver_error(fstype: str) -> str:
+    """Actionable message for a filesystem the host has no driver for."""
+    hint = _NO_DRIVER_HINTS.get(
+        fstype, "install the matching driver package for this host's kernel")
+    return f"no '{fstype}' filesystem driver on this host - {hint}"
+
+
+def _dmesg_hint(device: str) -> str:
+    """Last kernel ring-buffer line about *device* (the detail mount omits).
+
+    When mount(8) reports only its catch-all error, the driver's actual
+    complaint -- "block count 142336 exceeds size of device (40960 blocks)" and
+    the like -- is in dmesg. Surfacing it turns "see dmesg" into the answer.
+    """
+    name = Path(device).name
+    if not name:
+        return ""
+    try:
+        result = run_command(["dmesg", "--notime"], check=False, timeout=15)
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    for line in reversed(result.stdout.splitlines()[-200:]):
+        if name in line:
+            return line.strip()
+    return ""
 
 
 # Best-effort ("mount anyway") type sweep used in --force mode. Every known
@@ -749,9 +1136,14 @@ def mount_partition(partition: PartitionInfo, mount_point: Path,
                     force: bool = False) -> PartitionInfo:
     """Mount a single partition read-only with forensic flags.
 
-    Tries the detected filesystem (with driver fallbacks) and finally an
-    auto-detected mount, so partitions still mount when blkid couldn't name the
-    type. Error-isolating: on failure it sets ``mount_error`` and never raises.
+    Tries, in order: a dedicated FUSE binary when the detected type has one
+    (APFS/VMFS), ``mount`` with the detected type and its driver fallbacks, an
+    auto-detected mount, and finally a FUSE driver standing in for an absent
+    kernel driver (UFS). Error-isolating: on failure it sets ``mount_error`` --
+    diagnosed by :func:`_diagnose_mount_failure` -- and never raises.
+
+    Partitions the table marks as bootcode/swap/containers carry a
+    ``skip_reason`` and are passed over rather than counted as failures.
 
     When *force* is set, a failed standard mount falls through to a "mount
     anyway" sweep over every known driver (see :func:`_mount_attempts`), and all
@@ -763,12 +1155,26 @@ def mount_partition(partition: PartitionInfo, mount_point: Path,
         return partition
 
     if partition.filesystem in _SKIP_FILESYSTEMS:
+        partition.skip_reason = partition.skip_reason or partition.filesystem
         logger.info("Skipping %s (%s)", partition.device, partition.filesystem)
+        return partition
+
+    # Bootcode/swap/container entries have no superblock to mount. Reporting
+    # them as failures buries the partitions that genuinely didn't mount.
+    if partition.skip_reason:
+        logger.info("Skipping %s (%s - not a filesystem)",
+                    partition.device, partition.skip_reason)
         return partition
 
     ensure_mount_dir(mount_point)
 
-    last_error = "unknown filesystem type"
+    # Give an on-demand kernel module its chance to load before we conclude the
+    # driver is missing (and so the very first mount attempt can succeed).
+    if partition.filesystem and not _driver_available(partition.filesystem):
+        logger.warning("%s: %s", partition.device,
+                       _no_driver_error(partition.filesystem))
+
+    errors: List[str] = []
     fuse_error = ""  # FUSE-binary failure: the actionable message for APFS/VMFS
 
     # 1. Dedicated FUSE binaries (APFS/VMFS) have no kernel/`mount -t` driver,
@@ -810,10 +1216,11 @@ def mount_partition(partition: PartitionInfo, mount_point: Path,
         try:
             run_command(cmd, capture=True)
         except Exception as e:
-            last_error = _short_mount_error(e)
+            error = _short_mount_error(e)
+            errors.append(error)
             logger.debug(
                 "mount attempt failed (%s, -t %s): %s",
-                partition.device, fstype or "auto", last_error,
+                partition.device, fstype or "auto", error,
             )
             continue
 
@@ -828,14 +1235,55 @@ def mount_partition(partition: PartitionInfo, mount_point: Path,
         )
         return partition
 
-    # The actionable error: the detected type's own FUSE driver failure when it
-    # has one (e.g. "vmfs6-fuse not installed"); otherwise the standard-mount
-    # error ("bad superblock", ...). fuse_error is only set for the detected
-    # type -- not the force-mode sweep of unrelated drivers -- so an irrelevant
-    # swept driver can no longer mask the real failure.
-    partition.mount_error = fuse_error or last_error
+    # 3. FUSE drivers that stand in for an absent kernel driver (UFS). Tried
+    #    last: when the kernel has the driver it is the better mount.
+    for binary, args in _FUSE_FALLBACK_MOUNTERS.get(partition.filesystem, []):
+        cmd = [binary, *args, partition.device, str(mount_point)]
+        try:
+            run_command(cmd, capture=True)
+        except FileNotFoundError:
+            logger.debug("FUSE fallback missing: %s", binary)
+            continue
+        except Exception as e:
+            logger.debug("FUSE fallback failed (%s): %s", binary,
+                         _short_mount_error(e))
+            continue
+
+        partition.mount_point = mount_point
+        partition.mounted = True
+        logger.info("Mounted %s (%s) -> %s [%s]", partition.device,
+                    partition.filesystem, mount_point, binary)
+        return partition
+
+    partition.mount_error = fuse_error or _diagnose_mount_failure(partition, errors)
     logger.warning("Failed to mount %s: %s", partition.device, partition.mount_error)
     return partition
+
+
+def _diagnose_mount_failure(partition: PartitionInfo, errors: List[str]) -> str:
+    """Explain why every mount attempt failed, in the analyst's terms.
+
+    Prefers a cause we can state positively -- no driver on this host, or a
+    filesystem that doesn't fit the device -- over mount(8)'s catch-all, and
+    otherwise appends what the driver logged to the kernel ring buffer.
+    """
+    fs = partition.filesystem
+    if fs and not _driver_available(fs):
+        return _no_driver_error(fs)
+
+    exposed = partition.window_bytes or partition.size_bytes
+    if partition.fs_claimed_bytes and exposed and partition.fs_claimed_bytes > exposed:
+        return (f"the {fs or 'detected'} filesystem claims "
+                f"{partition.fs_claimed_bytes} bytes but only {exposed} bytes are "
+                f"available before the end of the media - the image is truncated "
+                f"or the partition table is wrong")
+
+    message = _best_mount_error(errors)
+    if _error_rank(message) >= 2:
+        hint = _dmesg_hint(partition.device)
+        if hint:
+            return f"{message} (kernel: {hint})"
+    return message
 
 
 def infer_os(partitions: List[PartitionInfo]) -> str:

@@ -270,10 +270,6 @@ def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
     _print_mount_summary(mount_id, image_path, image_type, result,
                           partition_infos, image_mount_dir, args)
 
-    # Optional Maelstrom callback
-    if getattr(args, "maelstrom", False):
-        _invoke_maelstrom(partition_infos, image_mount_dir, args)
-
     return mounted, partition_infos
 
 
@@ -418,18 +414,14 @@ def _apply_json_input(args):
     if opts.get("no_partitions"):
         args.no_partitions = True
 
-    callback = data.get("maelstrom_callback", {})
-    if callback.get("enabled"):
-        args.maelstrom = True
-        args.maelstrom_profiles = callback.get("profiles", [])
-        args.maelstrom_output = callback.get("output", "")
-
 
 def _print_mount_summary(mount_id, image_path, image_type, result,
                           partitions, image_mount_dir, args):
     """Print a human-readable mount summary."""
     mounted_count = sum(1 for p in partitions if p.mounted)
     failed_count = sum(1 for p in partitions if p.mount_error)
+    skipped_count = sum(1 for p in partitions
+                        if not p.mounted and not p.mount_error)
 
     print(file=sys.stderr)
     _h = lambda s: f"{Fore.GREEN}{Style.BRIGHT}{s}{Style.RESET_ALL}" if HAS_COLOR else s
@@ -452,13 +444,16 @@ def _print_mount_summary(mount_id, image_path, image_type, result,
 
     if partitions:
         print(f"\n  {'Partitions:':<18} {mounted_count} mounted", file=sys.stderr)
+        _w = lambda s: f"{Fore.YELLOW}{s}{Style.RESET_ALL}" if HAS_COLOR else s
+        if skipped_count:
+            print(f"  {'Skipped:':<18} "
+                  f"{skipped_count} not a mountable filesystem", file=sys.stderr)
         if failed_count:
-            _w = lambda s: f"{Fore.YELLOW}{s}{Style.RESET_ALL}" if HAS_COLOR else s
             print(f"  {'Warnings:':<18} {_w(f'{failed_count} failed to mount')}",
                   file=sys.stderr)
 
         for p in partitions:
-            fs_info = p.filesystem or "unknown"
+            fs_info = p.filesystem or getattr(p, "skip_reason", "") or "unknown"
             if p.label:
                 fs_info += f" ({p.label})"
             if p.mounted:
@@ -470,10 +465,22 @@ def _print_mount_summary(mount_id, image_path, image_type, result,
                 print(f"    {p.device:<20} {fs_info:<16} {_err('FAIL: ' + p.mount_error)}",
                       file=sys.stderr)
             else:
-                # Deliberately not mounted: pool member, swap, LVM PV, etc.
-                _skip = lambda s: f"{Fore.YELLOW}{s}{Style.RESET_ALL}" if HAS_COLOR else s
-                print(f"    {p.device:<20} {fs_info:<16} {_skip('skipped')}",
-                      file=sys.stderr)
+                # Deliberately not mounted: bootcode, swap, pool member, LVM PV.
+                reason = getattr(p, "skip_reason", "") or p.filesystem or "no filesystem"
+                print(f"    {p.device:<20} {fs_info:<16} "
+                      f"{_w(f'skipped ({reason})')}", file=sys.stderr)
+
+        # A filesystem bigger than its partition entry is exposed over a wider
+        # window than the table describes; say so, it changes what the mounted
+        # bytes mean.
+        widened = [p for p in partitions
+                   if getattr(p, "window_bytes", 0) > p.size_bytes > 0]
+        if widened:
+            print(f"\n  {'Extended windows:':<18} (filesystem larger than its "
+                  f"partition entry)", file=sys.stderr)
+            for p in widened:
+                print(f"    {p.device:<20} table {p.size_bytes} B -> exposed "
+                      f"{p.window_bytes} B", file=sys.stderr)
 
     # In best-effort (--force) mode, surface the raw block devices of anything
     # that couldn't be mounted so the analyst can image/carve them directly.
@@ -509,33 +516,6 @@ def _build_json_output(mounted, partitions) -> dict:
             for p in partitions
         ],
     }
-
-
-def _invoke_maelstrom(partitions, image_mount_dir, args):
-    """Invoke Maelstrom on mounted partitions."""
-    maelstrom_path = SCRIPT_DIR.parent / "Maelstrom" / "maelstrom.py"
-    if not maelstrom_path.exists():
-        logger.warning("Maelstrom not found at %s", maelstrom_path)
-        return
-
-    mounted_paths = [str(p.mount_point) for p in partitions if p.mounted]
-    if not mounted_paths:
-        logger.warning("No mounted partitions for Maelstrom to process")
-        return
-
-    for mount_path in mounted_paths:
-        cmd = [sys.executable, str(maelstrom_path)]
-        profiles = getattr(args, "maelstrom_profiles", [])
-        if profiles:
-            cmd.extend(["--profiles"] + profiles)
-        output_dir = getattr(args, "maelstrom_output", "") or str(image_mount_dir / "collected")
-        cmd.extend(["-o", output_dir, mount_path])
-
-        logger.info("Invoking Maelstrom on %s", mount_path)
-        try:
-            run_command(cmd, check=False, timeout=600)
-        except Exception as e:
-            logger.error("Maelstrom failed on %s: %s", mount_path, e)
 
 
 # ---------------------------------------------------------------------------
@@ -1067,14 +1047,6 @@ def build_parser() -> argparse.ArgumentParser:
     mount_parser.add_argument(
         "--json-input", metavar="FILE",
         help="Read mount request from JSON file (use '-' for stdin)",
-    )
-    mount_parser.add_argument(
-        "--maelstrom", action="store_true",
-        help="Invoke Maelstrom on mounted filesystems after mount",
-    )
-    mount_parser.add_argument(
-        "--maelstrom-profiles", nargs="*", default=[],
-        help="Profiles to pass to Maelstrom",
     )
     mount_parser.add_argument("-v", "--verbose", action="store_true")
     mount_parser.add_argument("--json", action="store_true",

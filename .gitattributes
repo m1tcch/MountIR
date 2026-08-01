@@ -1,0 +1,34 @@
+# MountIR runs on Linux and is invoked through a shebang, so every text file in
+# this repo is stored *and checked out* with LF -- on Windows too.
+#
+# Without this, a Windows checkout with core.autocrlf=true rewrites the working
+# tree to CRLF. Copying that tree into WSL (rather than cloning there) carries
+# the CRLF along, and `/usr/bin/env` then looks for an interpreter literally
+# named "python3\r":
+#
+#     /usr/bin/env: 'python3\r': No such file or directory
+#
+# `eol=lf` overrides core.autocrlf, so the Windows working tree stays LF and
+# any file-copy sync into Linux is safe.
+
+* text=auto eol=lf
+
+# Binary formats: never touch these.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.gz   binary
+*.zip  binary
+*.tar  binary
+*.E01  binary
+*.dd   binary
+*.raw  binary
+*.img  binary
+*.qcow2 binary
+*.vmdk binary
+*.vhd  binary
+*.vdi  binary
+*.aff  binary

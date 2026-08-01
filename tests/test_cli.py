@@ -144,8 +144,6 @@ class TestBuildParser:
             "--case-id", "IR-2026-001",
             "--no-partitions",
             "--force",
-            "--maelstrom",
-            "--maelstrom-profiles", "eventlogs", "registry",
             "-v", "--json",
         ])
         assert args.image_path == ["/evidence/disk.vmdk"]
@@ -153,8 +151,6 @@ class TestBuildParser:
         assert args.case_id == "IR-2026-001"
         assert args.no_partitions is True
         assert args.force is True
-        assert args.maelstrom is True
-        assert args.maelstrom_profiles == ["eventlogs", "registry"]
         assert args.verbose is True
         assert args.json is True
 
@@ -242,11 +238,6 @@ class TestApplyJsonInput:
             "case_id": "IR-2026-001",
             "mount_base": "/mnt/custom",
             "mount_options": {"no_partitions": True},
-            "maelstrom_callback": {
-                "enabled": True,
-                "profiles": ["eventlogs"],
-                "output": "/evidence/collected",
-            },
         }))
 
         args = Namespace(json_input=str(json_file))
@@ -256,9 +247,6 @@ class TestApplyJsonInput:
         assert args.case_id == "IR-2026-001"
         assert args.mount_base == "/mnt/custom"
         assert args.no_partitions is True
-        assert args.maelstrom is True
-        assert args.maelstrom_profiles == ["eventlogs"]
-        assert args.maelstrom_output == "/evidence/collected"
 
     def test_json_from_stdin(self):
         """Parse JSON from stdin."""

@@ -28,11 +28,12 @@ cleanup is reliable, and speaks JSON for pipeline orchestration.
 | **E01 / L01** | `.e01`, `.l01` | `ewfmount` | – | ✅ |
 | **Ex01 / Lx01** *(EWF v2)* | `.ex01`, `.lx01` | `ewfmount` † | – | ✅ |
 | **DD / Raw / IMG** | `.dd`, `.raw`, `.img`, `.bin`, `.001` | `losetup` | – | ✅ |
-| **VMDK** | `.vmdk` | `qemu-nbd` | `vmdkmount` | |
-| **VHD / VHDX** | `.vhd`, `.vhdx` | `qemu-nbd` | `vhdimount` | |
-| **QCOW2** | `.qcow2`, `.qcow` | `qemu-nbd` | – | |
+| **VMDK** | `.vmdk` | `qemu-nbd` | `vmdkmount` | ✅ |
+| **VHD / VHDX** | `.vhd`, `.vhdx` | `qemu-nbd` | `vhdimount` | ✅ |
+| **QCOW2** | `.qcow2`, `.qcow` | `qemu-nbd` | – | ✅ |
+| **VDI** *(VirtualBox)* | `.vdi` | `qemu-nbd` | – | ✅ |
+| **AFF** | `.aff` | `affuse` | – | ✅ |
 | **ISO** | `.iso` | `mount -o loop` | – | |
-| **AFF** | `.aff` | `affuse` | – | |
 
 **✅ Verified** = confirmed mounted end-to-end against **real evidence images**:
 
@@ -40,7 +41,16 @@ cleanup is reliable, and speaks JSON for pipeline orchestration.
   table) and a partitioned **ext4** Linux image.
 - **Ex01** *(EWF v2)* — validated end-to-end on a partitioned **XFS** Linux
   server image with a FUSE-enabled modern libewf.
-- **DD / Raw / IMG** — validated via the `losetup` raw path.
+- **DD / Raw / IMG** — validated via the `losetup` raw path, including a
+  multi-filesystem disk (btrfs + ext4 + exFAT + NTFS); mounting each of those
+  volumes depends on the host having their drivers.
+- **VMDK** and **VDI** — validated on the same Android-x86 (LineageOS) guest
+  exported to both formats; **ext4** volume mounted via `qemu-nbd`.
+- **VHD** and **QCOW2** — validated on the same FreeBSD 15.1 UFS guest exported
+  to both formats; GPT read, **ESP (vfat)** mounted, `freebsd-boot`/
+  `freebsd-swap` correctly skipped. Mounting the **UFS** root additionally needs
+  a UFS driver on the host — see [Filesystem drivers](#filesystem-drivers).
+- **AFF** — validated on single-volume **NTFS** images via `affuse`.
 
 Unmarked formats are implemented and covered by the unit-test suite, but have
 not yet been confirmed against real-world samples — treat them as supported but
@@ -66,9 +76,9 @@ raw device (`ewf1`) that partition detection then walks.
 <details>
 <summary>Additional formats the engine also handles</summary>
 
-AFF4 (`.aff4`), VirtualBox VDI (`.vdi`), OVA (`.ova`), Apple DMG (`.dmg`) and
-sparseimage/sparsebundle, and Xen XVA (`.xva`). These ship with handlers but are
-outside the core IR set above; tool availability varies by distro.
+AFF4 (`.aff4`), OVA (`.ova`), Apple DMG (`.dmg`) and sparseimage/sparsebundle,
+and Xen XVA (`.xva`). These ship with handlers but are outside the core IR set
+above; tool availability varies by distro.
 </details>
 
 ---
@@ -90,12 +100,25 @@ outside the core IR set above; tool availability varies by distro.
   `ntfs-3g`) and a final auto-detect attempt. Reports a best-effort **OS guess**
   (Windows / Linux / macOS).
 - **Partition detection** with `fdisk`/`blkid`, plus **LVM** discovery and
-  activation.
+  activation. Slices the partition table marks as non-filesystem (`freebsd-boot`
+  bootcode, `freebsd-swap`, Linux swap, BIOS boot, MSR, extended containers) are
+  reported as **skipped**, not as mount failures, so the warning count means
+  what it says.
+- **Oversized-filesystem recovery** — when a filesystem's superblock claims more
+  space than its partition-table entry allows, every driver refuses the mount
+  outright. MountIR reads the claimed extent from the superblock (ext2/3/4,
+  btrfs, XFS, exFAT, NTFS) and re-exposes the partition over that full range,
+  capped at the end of the media, so the volume mounts. The widened window is
+  logged and listed in the summary — it can overlap neighbouring partitions.
+- **Actionable mount errors** — the real diagnosis is reported instead of
+  mount(8)'s "see dmesg" boilerplate: a missing driver is named as such (with
+  how to install it), a filesystem that outgrows the media is named as
+  truncation, and an otherwise-opaque failure carries the kernel's own
+  ring-buffer message.
 - **State tracking** — every mount is recorded so `unmount` and `list` are
   reliable, and stale mounts (e.g. after a reboot) are flagged. `clean`
   scavenges orphaned mounts from the mount base.
-- **JSON I/O** for orchestration (Whirlpool) and an optional **Maelstrom**
-  post-mount collection callback.
+- **JSON I/O** for orchestration (Whirlpool).
 - **Self-bootstrapping** — on first run MountIR pulls every dependency it can
   (see below).
 
@@ -256,6 +279,7 @@ Installed automatically by `mountir setup`. The canonical mapping lives in
 | `ntfs-3g` | `ntfs-3g` | NTFS mounting |
 | `vmfs-fuse` | `vmfs-tools` | VMware **VMFS3/5** datastores |
 | `vmfs6-fuse` | `vmfs6-tools` | VMware **VMFS6** datastores (ESXi 6.5+; not in every distro's repos) |
+| `mount.exfat-fuse` | `exfat-fuse` | exFAT on kernels without `CONFIG_EXFAT_FS` |
 | `mmls` | `sleuthkit` | Partition layout |
 | `fdisk`, `blkid`, `losetup`, `mount` | `util-linux` | Loop devices, partitions, mounting |
 | `file` | `file` | Magic-byte format detection |
@@ -267,6 +291,41 @@ sudo apt-get update
 sudo apt-get install ewf-tools qemu-utils afflib-tools libvmdk-utils \
                      libvhdi-utils kpartx lvm2 fuse ntfs-3g sleuthkit \
                      util-linux file
+```
+
+### Filesystem drivers
+
+Mounting a *container* (E01, VMDK, QCOW2, …) and mounting the *filesystems*
+inside it are separate problems: MountIR can always open the container, but the
+volume only mounts if this host has a driver for that filesystem. MountIR checks
+`/proc/filesystems`, tries `modprobe` (many distros ship `ufs`/`exfat` as
+modules that are only loaded on first use), then falls back to a FUSE driver —
+and when nothing can mount it, says so by name instead of reporting a generic
+failure.
+
+| Filesystem | In-kernel | Userspace fallback | Notes |
+| --- | --- | --- | --- |
+| ext2/3/4, XFS, btrfs, vfat, ISO9660 | ✅ everywhere | – | |
+| NTFS | `ntfs3` (5.15+) | `ntfs-3g` | |
+| exFAT | `exfat` (5.4+) | `mount.exfat-fuse` | |
+| **UFS** *(FreeBSD, pfSense, NetScaler)* | `ufs` — **optional module** | `fuse-ufs` | see below |
+| APFS | – | `apfs-fuse` | built from source |
+| VMFS3/5/6 | – | `vmfs-fuse`, `vmfs6-fuse` | |
+
+**UFS needs a driver you may not have.** The Linux `ufs` driver is not built
+into every kernel. On Ubuntu it lives in `linux-modules-extra-$(uname -r)`; the
+**Microsoft WSL2 kernel omits it entirely and ships no loadable modules at all**,
+so a FreeBSD image mounts its ESP but not its UFS root there. Either run on a
+kernel that has it:
+
+```bash
+sudo apt-get install linux-modules-extra-$(uname -r) && sudo modprobe ufs
+```
+
+or install the userspace driver, which MountIR will use automatically:
+
+```bash
+cargo install fuse-ufs
 ```
 
 ### Built from source
@@ -331,8 +390,7 @@ sudo mountir <command> ...                    # if symlinked onto PATH
 sudo mountir mount <image|dir|glob> [<more> ...] \
   [-d|--mount-base DIR] [-r|--recursive] [--pattern GLOB] [--force] \
   [--case-id ID] [--no-partitions] \
-  [--json-input FILE] [--maelstrom] [--maelstrom-profiles PROFILE ...] \
-  [-v] [--json]
+  [--json-input FILE] [-v] [--json]
 ```
 
 The positional argument accepts **one or more** images, shell globs, and/or
@@ -352,8 +410,6 @@ still mount.
 | `--case-id ID` | Case identifier, used in mount-point naming |
 | `--no-partitions` | Mount the container only; skip partition detection |
 | `--json-input FILE` | Read the mount request from a JSON file (`-` = stdin) |
-| `--maelstrom` | Run Maelstrom on mounted filesystems after mounting |
-| `--maelstrom-profiles ...` | Profiles to pass to Maelstrom |
 | `-v`, `--verbose` | Verbose logging |
 | `--json` | Emit machine-readable JSON to stdout (a single image emits one object; several emit `{"mounts": [...]}`) |
 
@@ -465,12 +521,7 @@ driven by upstream tools such as Whirlpool:
   "image_path": "/evidence/disk.E01",
   "case_id": "IR-2026-001",
   "mount_base": "/mnt/case001",
-  "mount_options": { "no_partitions": false },
-  "maelstrom_callback": {
-    "enabled": true,
-    "profiles": ["eventlogs", "registry"],
-    "output": "/evidence/collected"
-  }
+  "mount_options": { "no_partitions": false }
 }
 ```
 
