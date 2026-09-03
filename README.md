@@ -65,7 +65,12 @@ unverified until you've validated one in your environment.
 Detection uses the file extension first, then falls back to `file(1)` magic
 bytes, so correctly-formatted images with the wrong extension still mount.
 Multi-segment EWF sets (`.E01`/`.E02`/…) and split raw (`.001`/`.002`/…) are
-handled automatically — just point MountIR at the first segment.
+handled automatically — just point MountIR at the first segment. A split-raw set
+is presented as one virtual raw image by `affuse`, so nothing is copied; without
+afflib-tools MountIR falls back to concatenating the segments into scratch space
+(see [`MOUNTIR_TMPDIR`](#scratch-space)) and says so. `.001` is ambiguous —
+FTK Imager uses it for split raw and some tools use it for AFF containers — so
+the AFF signature is checked before the segment set.
 
 **Logical evidence files** (`.L01`/`.Lx01`) hold a reconstructed file/folder
 tree rather than a disk image, so MountIR mounts them with `ewfmount -f files`:
@@ -112,6 +117,20 @@ above; tool availability varies by distro.
   bootcode, `freebsd-swap`, Linux swap, BIOS boot, MSR, extended containers) are
   reported as **skipped**, not as mount failures, so the warning count means
   what it says.
+- **BitLocker volumes** — a volume `blkid` reports as BitLocker is decrypted
+  with `bdemount` and the plaintext volume mounted like any other partition.
+  Supply the credential with `--bde-password`, `--bde-recovery-key`,
+  `--bde-startup-key FILE` or `--bde-key HEX` (or the `MOUNTIR_BDE_PASSWORD` /
+  `MOUNTIR_BDE_RECOVERY_KEY` env vars, which keep the secret out of the process
+  list). Without a credential the volume is reported as **locked**, not as a
+  mount failure. The ciphertext image is never written to.
+- **Volume Shadow Copies** — `--vss` runs `vshadowinfo`/`vshadowmount` over each
+  exposed volume and mounts every shadow store as its own read-only volume, so
+  historical versions of the filesystem are browsable alongside the live one.
+- **Manual overrides** — `--offset` exposes a single volume at a byte offset
+  (accepts `2048s` sector form and `K`/`M`/`G` suffixes) when the partition
+  table is unusable; `--filesystem TYPE` supplies a type for volumes `blkid`
+  could not identify. Detected types always win over the flag.
 - **Oversized-filesystem recovery** — when a filesystem's superblock claims more
   space than its partition-table entry allows, every driver refuses the mount
   outright. MountIR reads the claimed extent from the superblock (ext2/3/4,
@@ -281,6 +300,8 @@ Installed automatically by `mountir setup`. The canonical mapping lives in
 | `affuse` | `afflib-tools` | AFF |
 | `vmdkmount` | `libvmdk-utils` | VMDK (fallback) |
 | `vhdimount` | `libvhdi-utils` | VHD/VHDX (fallback) |
+| `bdemount` | `libbde-utils` | BitLocker volume unlocking |
+| `vshadowmount` | `libvshadow-utils` | Volume Shadow Copies (`--vss`) |
 | `kpartx` | `kpartx` | Partition device mapping |
 | `pvs` | `lvm2` | LVM detection / activation |
 | `fusermount` | `fuse` | FUSE unmounting |
@@ -297,8 +318,8 @@ Manual install on Debian/Ubuntu:
 ```bash
 sudo apt-get update
 sudo apt-get install ewf-tools qemu-utils afflib-tools libvmdk-utils \
-                     libvhdi-utils kpartx lvm2 fuse ntfs-3g sleuthkit \
-                     util-linux file
+                     libvhdi-utils libbde-utils libvshadow-utils \
+                     kpartx lvm2 fuse ntfs-3g sleuthkit util-linux file
 ```
 
 ### Filesystem drivers
@@ -375,11 +396,24 @@ not just read: `mountir setup` builds from a clean tree, forces the reliable
 and **verifies the built `ewfmount` links FUSE before reporting success** — a
 FUSE-less build is treated as a failure with the fix, never silently accepted.
 The libewf build is **pinned to `20240506`** for forensic reproducibility (you
-want to know exactly which tool version touched the evidence). To pull a
+want to know exactly which tool version touched the evidence), and the download
+is **verified against a pinned SHA-256** before anything is built from it — the
+version pin says which release was wanted, the digest proves that's what
+arrived. A mismatch aborts the build and leaves no tarball behind. To pull a
 different release, set the version and force a rebuild over the existing install:
 
 ```bash
 sudo MOUNTIR_LIBEWF_VERSION=20240506 mountir setup --force
+```
+
+MountIR only carries digests for versions it has been tested against, so an
+overridden version is downloaded with a loud "cannot be verified" warning.
+Pin it yourself to keep the check:
+
+```bash
+sudo MOUNTIR_LIBEWF_VERSION=20250101 \
+     MOUNTIR_LIBEWF_SHA256=<sha256 of the release tarball> \
+     mountir setup --force
 ```
 
 > ⚠️ Bumping libewf is deliberate: a newer upstream release may change tool
@@ -418,6 +452,8 @@ sudo mountir <command> ...                    # if symlinked onto PATH
 ```bash
 sudo mountir mount <image|dir|glob> [<more> ...] \
   [-d|--mount-base DIR] [-r|--recursive] [--pattern GLOB] [--force] \
+  [-f|--filesystem TYPE] [-o|--offset BYTES] [--vss] \
+  [--bde-password PW] [--bde-recovery-key KEY] [--bde-startup-key FILE] \
   [--case-id ID] [--no-partitions] \
   [--json-input FILE] [-v] [--json]
 ```
@@ -436,6 +472,13 @@ still mount.
 | `-r`, `--recursive` | When a directory is given, scan it **recursively** for images |
 | `--pattern GLOB` | When scanning a directory, only mount files matching this glob (e.g. `'*.E01'`) |
 | `--force`, `--best-effort` | **Mount anyway**: survive a corrupt/absent partition table and brute-force the filesystem type regardless of OS (see [Best-effort mounting](#best-effort-mounting----force)) |
+| `-f`, `--filesystem TYPE` | Filesystem type to assume for volumes `blkid` cannot identify (`ntfs`, `ext4`, `vfat`, `exfat`, `hfsplus`, `ufs`, ...). A detected type always wins |
+| `-o`, `--offset BYTES` | Skip the partition table and expose one volume at this byte offset. Accepts sectors (`2048s`) and `K`/`M`/`G` suffixes |
+| `--vss` | Also mount Volume Shadow Copies found on the exposed volumes (needs `libvshadow-utils`) |
+| `--bde-password PW` | BitLocker password. Prefer `MOUNTIR_BDE_PASSWORD` -- an argument is readable by any local user in the process list |
+| `--bde-recovery-key KEY` | BitLocker 48-digit recovery key (or `MOUNTIR_BDE_RECOVERY_KEY`) |
+| `--bde-startup-key FILE` | BitLocker startup key (`.BEK`) file |
+| `--bde-key HEX` | BitLocker full volume encryption key + tweak key, in hex |
 | `--case-id ID` | Case identifier, used in mount-point naming |
 | `--no-partitions` | Mount the container only; skip partition detection |
 | `--json-input FILE` | Read the mount request from a JSON file (`-` = stdin) |
@@ -454,6 +497,13 @@ sudo mountir mount /evidence/ --pattern '*.E01'
 
 # Several images at once
 sudo mountir mount /evidence/a.Ex01 /evidence/b.vmdk /evidence/c.dd
+
+# A BitLocker-encrypted laptop image, plus its volume shadow copies
+MOUNTIR_BDE_RECOVERY_KEY='123456-...-654321' \
+  sudo -E mountir mount /evidence/laptop.E01 --vss
+
+# A disk whose partition table is gone, but whose NTFS volume starts at sector 2048
+sudo mountir mount /evidence/damaged.dd --offset 2048s --filesystem ntfs
 ```
 
 #### Best-effort mounting (`--force`)
@@ -532,11 +582,20 @@ Each mount is created under `--mount-base` in a self-describing tree:
 
 ```
 /mnt/mountir/<mount-id>/
-├── container/                 # FUSE/raw container (e.g. ewf1)
+├── container/                   # FUSE/raw container (e.g. ewf1)
+├── bde_p2/                      # BitLocker plaintext view (only when unlocked)
+├── vss_p2/                      # shadow-copy stores (only with --vss)
+├── zfs/<pool>/                  # imported ZFS pool altroot (only for ZFS)
 └── partitions/
-    ├── p1_ntfs_Windows/       # partition 1, NTFS, label "Windows"
-    └── p2_ext4_root/          # partition 2, ext4, label "root"
+    ├── p1_ntfs_Windows/         # partition 1, NTFS, label "Windows"
+    ├── p2_ext4_root/            # partition 2, ext4, label "root"
+    ├── p402_ntfs_Windows/       # BitLocker volume unlocked behind p2
+    └── p520_ntfs_Windows-vss1/  # a shadow copy of that volume
 ```
+
+Partition numbers above 200 are volumes MountIR surfaced rather than read from
+the partition table: `2xx` LVM logical volumes, `3xx` ZFS datasets, `4xx`
+BitLocker plaintext volumes, `5xx` shadow copies.
 
 ---
 
@@ -564,11 +623,54 @@ readable status always goes to stderr, keeping stdout clean for pipelines).
 | Artifact | Location (preferred → fallback) |
 | --- | --- |
 | Mount state | `/var/lib/mountir/mountir_state.json` → project dir |
+| State lock | `mountir_state.json.lock` beside the state file |
 | Bootstrap marker | `/var/lib/mountir/.bootstrapped` → project dir |
 | Logs | `../logs/mountir_<timestamp>.log` → `./logs` → `/tmp` |
 
 `list` cross-checks `/proc/mounts` and flags entries that are no longer mounted
 as `[STALE]`; clear them with `unmount --all`.
+
+### Running several MountIR processes at once
+
+Safe — a batch mount and an unmount from another shell won't tread on each
+other:
+
+- **Mount state** is mutated under an exclusive `flock` on a sidecar lock file,
+  and re-read inside the lock, so two processes recording different mounts
+  cannot overwrite each other's entry. The lock is an open file descriptor, so a
+  killed run releases it rather than wedging the next one.
+- **Mount points** are claimed by *creating* the directory, which is atomic:
+  two runs can never resolve the same mount id and mount into one tree.
+- **NBD devices** are claimed by the `qemu-nbd` attach itself rather than by
+  scanning for a free device and then attaching. A device another process (or
+  another tool entirely) took first fails the attach, and MountIR moves to the
+  next candidate.
+
+### Scratch space
+
+Most formats are mounted in place — nothing is copied. Four cannot be, because
+the evidence has to be materialised as a single raw file before the kernel can
+attach it:
+
+| Format | Why | Scratch needed |
+| --- | --- | --- |
+| DMG / sparseimage | `dmg2img` converts to raw | full image size |
+| OVA | TAR must be unpacked to reach the VMDK | full image size |
+| XVA | numbered chunks must be concatenated | full image size |
+| Split raw **without `affuse`** | segments must be concatenated | full image size |
+
+Scratch directories are created with `tempfile`, so they land in `TMPDIR`
+(`/tmp` by default) — which on many hosts is a **RAM-backed tmpfs**, where
+converting any real image will exhaust memory. Point the scratch at a disk with
+room for it:
+
+```bash
+sudo MOUNTIR_TMPDIR=/data/scratch mountir mount /evidence/mac.dmg
+```
+
+The scratch copy is deleted by `unmount`, and `clean` removes any left behind by
+an interrupted run. Installing `afflib-tools` removes the split-raw case
+entirely.
 
 ---
 

@@ -3,12 +3,11 @@
 
 import shutil
 import tarfile
-import tempfile
 from pathlib import Path
 from typing import List
 
 from handlers.base import BaseHandler, MountResult
-from utils import logger, run_command
+from utils import logger, run_command, make_scratch_dir, safe_extractall
 
 
 COPY_BUFFER = 4 * 1024 * 1024  # 4 MB — large buffer for disk image I/O
@@ -55,14 +54,14 @@ class XvaHandler(BaseHandler):
           3. Concatenate chunks into a single raw image
           4. Attach via losetup
         """
-        temp_dir = Path(tempfile.mkdtemp(prefix="mountir_xva_"))
+        temp_dir = make_scratch_dir("xva")
 
         # --- Step 1: Extract ---
         try:
             with tarfile.open(image_path, "r") as tf:
-                tf.extractall(temp_dir)
+                safe_extractall(tf, temp_dir)
                 logger.debug("Extracted XVA to: %s", temp_dir)
-        except (tarfile.TarError, OSError) as e:
+        except (tarfile.TarError, OSError, ValueError) as e:
             shutil.rmtree(temp_dir, ignore_errors=True)
             return MountResult(
                 success=False,
@@ -75,7 +74,7 @@ class XvaHandler(BaseHandler):
             shutil.rmtree(temp_dir, ignore_errors=True)
             return MountResult(
                 success=False,
-                error=f"No disk chunk directories (Ref:N/) found in XVA",
+                error="No disk chunk directories (Ref:N/) found in XVA",
             )
 
         # Use the first Ref directory (primary disk)

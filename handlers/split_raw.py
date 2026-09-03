@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
-"""Handler for split raw disk images (.001/.002/.003 segments)."""
+"""Handler for split raw disk images (.001/.002/.003 segments).
+
+Preferred path is ``affuse``, which presents the whole segment set as a single
+virtual raw file without copying a byte -- the same approach EverReady's
+``er2.sh`` takes.  Concatenating the segments into a scratch file (the fallback
+when afflib-tools isn't installed) needs as much free disk as the evidence and
+takes as long as a full copy, so it is only used when there is no alternative.
+"""
 
 import shutil
-import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from handlers.base import BaseHandler, MountResult
 from handlers.raw import RawHandler
-from utils import logger, run_command
+from utils import (
+    logger, run_command, tool_exists, fuse_unmount, run_fuse_mount,
+    FUSE_ACCESS_OPTS, make_scratch_dir,
+)
 
 
 COPY_BUFFER = 4 * 1024 * 1024  # 4 MB — large buffer for disk image I/O
 
 
 class SplitRawHandler(BaseHandler):
-    """Mount split raw images by reassembling segments, then delegating to RawHandler.
+    """Mount split raw images (image.001, image.002, ...).
 
-    Split raw images consist of numbered segments (image.001, image.002, etc.)
-    that must be concatenated to reconstruct the original raw disk image.
-    After reassembly, the combined image is mounted via RawHandler (losetup).
+    ``affuse`` exposes the set as one raw file through FUSE (no copy); without
+    it the segments are concatenated into a scratch file and loop-mounted via
+    :class:`RawHandler`.
     """
 
     @property
@@ -29,6 +38,10 @@ class SplitRawHandler(BaseHandler):
     @property
     def required_tools(self) -> List[str]:
         return ["losetup"]
+
+    @property
+    def fallback_tools(self) -> List[str]:
+        return ["affuse"]
 
     def _find_segments(self, image_path: Path) -> List[Path]:
         """Find all split raw segments in order.
@@ -51,11 +64,7 @@ class SplitRawHandler(BaseHandler):
         return segments
 
     def mount(self, image_path: Path, mount_point: Path) -> MountResult:
-        """Reassemble split segments into a single raw image, then loop-mount.
-
-        Creates a temporary combined raw file by concatenating all segments,
-        then delegates to RawHandler for the actual mount.
-        """
+        """Expose the segment set as one raw image, then hand it downstream."""
         segments = self._find_segments(image_path)
         if not segments:
             return MountResult(
@@ -68,16 +77,75 @@ class SplitRawHandler(BaseHandler):
                 "Only one segment found for %s, delegating to RawHandler",
                 image_path.name,
             )
-            raw_handler = RawHandler()
-            return raw_handler.mount(image_path, mount_point)
+            return RawHandler().mount(image_path, mount_point)
+
+        if tool_exists("affuse"):
+            result = self._mount_affuse(image_path, mount_point, len(segments))
+            if result.success:
+                return result
+            logger.warning(
+                "affuse could not expose %s (%s); falling back to "
+                "concatenation", image_path.name, result.error,
+            )
+
+        return self._mount_concatenated(image_path, mount_point, segments)
+
+    def _mount_affuse(self, image_path: Path, mount_point: Path,
+                      count: int) -> MountResult:
+        """Expose the whole set as one virtual raw file via affuse (no copy)."""
+        try:
+            run_fuse_mount(["affuse", str(image_path), str(mount_point)],
+                           FUSE_ACCESS_OPTS)
+        except Exception as e:
+            return MountResult(success=False, error=str(e))
+
+        raw_path = self._affuse_raw_file(image_path, mount_point)
+        if not raw_path:
+            fuse_unmount(mount_point)
+            return MountResult(
+                success=False,
+                error="affuse succeeded but exposed no raw image",
+            )
 
         logger.info(
-            "Reassembling %d segments for %s",
-            len(segments), image_path.name,
+            "Exposed %d segments of %s via affuse -> %s (no copy)",
+            count, image_path.name, raw_path,
+        )
+        return MountResult(
+            success=True,
+            mount_point=mount_point,
+            raw_image_path=raw_path,
         )
 
-        # Create a temporary directory for the combined file
-        temp_dir = Path(tempfile.mkdtemp(prefix="mountir_split_"))
+    @staticmethod
+    def _affuse_raw_file(image_path: Path, mount_point: Path) -> Optional[Path]:
+        """Locate the raw file affuse exposed (naming varies by version)."""
+        for candidate in (mount_point / f"{image_path.name}.raw",
+                          mount_point / f"{image_path.stem}.raw"):
+            if candidate.exists():
+                return candidate
+        try:
+            files = [p for p in mount_point.iterdir() if p.is_file()]
+        except OSError:
+            return None
+        return files[0] if files else None
+
+    def _mount_concatenated(self, image_path: Path, mount_point: Path,
+                            segments: List[Path]) -> MountResult:
+        """Fallback: concatenate the segments into scratch, then loop-mount.
+
+        This writes a full-size copy of the evidence; set ``MOUNTIR_TMPDIR`` to
+        a volume with room for it (``/tmp`` is a RAM-backed tmpfs on many
+        hosts).
+        """
+        total = sum(s.stat().st_size for s in segments)
+        logger.warning(
+            "affuse is unavailable - reassembling %d segments of %s (%d bytes) "
+            "into scratch space. Install afflib-tools to mount without copying.",
+            len(segments), image_path.name, total,
+        )
+
+        temp_dir = make_scratch_dir("split")
         combined_path = temp_dir / f"{image_path.stem}.raw"
 
         try:
@@ -92,32 +160,23 @@ class SplitRawHandler(BaseHandler):
                 len(segments), combined_path,
             )
 
-            # Delegate to RawHandler
-            raw_handler = RawHandler()
-            result = raw_handler.mount(combined_path, mount_point)
-
+            result = RawHandler().mount(combined_path, mount_point)
             if result.success:
-                # Store the raw image path so unmount can clean it up
+                # Remembered so unmount can delete the reassembled copy.
                 result.raw_image_path = combined_path
             else:
-                # Clean up on failure
-                combined_path.unlink(missing_ok=True)
-                temp_dir.rmdir()
-
+                shutil.rmtree(temp_dir, ignore_errors=True)
             return result
 
         except Exception as e:
-            # Clean up on error
-            combined_path.unlink(missing_ok=True)
-            temp_dir.rmdir()
+            shutil.rmtree(temp_dir, ignore_errors=True)
             return MountResult(success=False, error=str(e))
 
     def unmount(self, mount_result: MountResult) -> bool:
-        """Detach loop device and clean up the reassembled temporary file."""
-        success = True
-
-        # Detach the loop device
+        """Release the segment set: detach the loop or drop the FUSE mount."""
+        # Concatenated (or single-segment) path: a loop device backs the mount.
         if mount_result.loop_device:
+            success = True
             try:
                 run_command(["losetup", "-d", mount_result.loop_device], capture=False)
                 logger.info("Detached loop device: %s", mount_result.loop_device)
@@ -126,24 +185,27 @@ class SplitRawHandler(BaseHandler):
                     "Failed to detach %s: %s", mount_result.loop_device, e
                 )
                 success = False
+            self._remove_reassembled(mount_result.raw_image_path)
+            return success
 
-        # Clean up the temporary combined raw file
-        if mount_result.raw_image_path and mount_result.raw_image_path.exists():
-            try:
-                temp_dir = mount_result.raw_image_path.parent
-                mount_result.raw_image_path.unlink()
-                logger.debug(
-                    "Removed temporary combined image: %s",
-                    mount_result.raw_image_path,
-                )
-                # Remove the temp directory if empty
-                if temp_dir.exists() and not any(temp_dir.iterdir()):
-                    temp_dir.rmdir()
-                    logger.debug("Removed temp directory: %s", temp_dir)
-            except Exception as e:
-                logger.warning(
-                    "Failed to clean up temp file %s: %s",
-                    mount_result.raw_image_path, e,
-                )
+        # affuse path: the raw image is a FUSE view, nothing was copied.
+        if mount_result.mount_point:
+            return fuse_unmount(mount_result.mount_point)
+        return True
 
-        return success
+    @staticmethod
+    def _remove_reassembled(raw_image_path: Optional[Path]) -> None:
+        """Delete the concatenated scratch copy (and its dir) if we made one."""
+        if not raw_image_path or not raw_image_path.exists():
+            return
+        temp_dir = raw_image_path.parent
+        try:
+            raw_image_path.unlink()
+            logger.debug("Removed temporary combined image: %s", raw_image_path)
+            if temp_dir.exists() and not any(temp_dir.iterdir()):
+                temp_dir.rmdir()
+                logger.debug("Removed temp directory: %s", temp_dir)
+        except Exception as e:
+            logger.warning(
+                "Failed to clean up temp file %s: %s", raw_image_path, e,
+            )

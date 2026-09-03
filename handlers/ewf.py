@@ -11,8 +11,7 @@ from typing import List
 import bootstrap
 from handlers.base import BaseHandler, MountResult
 from utils import (
-    logger, run_command, fuse_unmount, run_fuse_mount,
-    FUSE_ACCESS_OPTS_LIBYAL,
+    logger, fuse_unmount, run_fuse_mount, FUSE_ACCESS_OPTS_LIBYAL,
 )
 
 # EWF version 2 containers (EnCase v7+); only a modern libewf can read these.

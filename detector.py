@@ -99,7 +99,6 @@ _E01_SEGMENT_PATTERN = None  # compiled on first use
 
 def _is_e01_segment(ext: str) -> bool:
     """Check if an extension looks like an E01 segment (.E02-.E99, .EAA-.EZZ)."""
-    import re
     global _E01_SEGMENT_PATTERN
     if _E01_SEGMENT_PATTERN is None:
         _E01_SEGMENT_PATTERN = re.compile(
@@ -205,6 +204,22 @@ def find_images_in_dir(
     return [p for p in sorted(globber("*")) if is_primary_image(p)]
 
 
+# AFF containers start with the 8-byte signature 41 46 46 31 30 0d 0a 00
+# ("AFF10", CR, LF, NUL). Split-raw segments produced by FTK Imager share the
+# .001 extension, so this is what tells the two apart without shelling out to
+# file(1).
+_AFF_MAGIC = b"AFF10\r\n\x00"
+
+
+def _looks_like_aff(path: Path) -> bool:
+    """True when *path* begins with the AFF container signature."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(len(_AFF_MAGIC)) == _AFF_MAGIC
+    except OSError:
+        return False
+
+
 def detect_image_type(image_path: Path) -> ImageType:
     """Detect image type from extension first, then file(1) magic.
 
@@ -223,8 +238,17 @@ def detect_image_type(image_path: Path) -> ImageType:
     if ext in _EXTENSION_MAP:
         detected = _EXTENSION_MAP[ext]
 
-        # Special case: .001 may be a split raw if .002 sibling exists
+        # Special case: .001 is ambiguous. AFF images are also commonly handed
+        # out with a .001 extension, and concatenating those segments as if they
+        # were raw would produce garbage -- so check the AFF magic first, then
+        # look for a .002 sibling that makes this a split-raw set.
         if ext == ".001" and detected == ImageType.RAW:
+            if _looks_like_aff(image_path):
+                logger.debug(
+                    "%s carries the AFF signature despite its .001 extension",
+                    image_path.name,
+                )
+                return ImageType.AFF
             sibling_002 = image_path.parent / f"{image_path.stem}.002"
             if sibling_002.exists():
                 logger.debug(

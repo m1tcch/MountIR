@@ -26,6 +26,7 @@ On the very first run MountIR:
 against the current interpreter.
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -34,7 +35,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from utils import logger, tool_exists, SCRIPT_DIR
+from utils import logger, tool_exists, safe_extractall, SCRIPT_DIR
 
 # ---------------------------------------------------------------------------
 # Dependency declarations
@@ -55,6 +56,9 @@ SYSTEM_PACKAGES: Dict[str, str] = {
     "affuse": "afflib-tools",       # AFF
     "vmdkmount": "libvmdk-utils",   # VMDK (fallback)
     "vhdimount": "libvhdi-utils",   # VHD/VHDX (fallback)
+    # Encrypted / snapshot containers found inside an image
+    "bdemount": "libbde-utils",         # BitLocker volume unlocking
+    "vshadowmount": "libvshadow-utils",  # Volume Shadow Copies (--vss)
     # Partition / filesystem support
     "kpartx": "kpartx",             # partition device mapping
     "pvs": "lvm2",                  # LVM detection/activation
@@ -137,6 +141,18 @@ LIBEWF_RELEASE_URL = (
     "https://github.com/libyal/libewf/releases/download/"
     "{version}/libewf-experimental-{version}.tar.gz"
 )
+# SHA-256 of the pinned release tarball. A version pin alone says *which*
+# release we wanted; the digest proves we got it. This is the tool that reads
+# the evidence, so a swapped or truncated download must fail the build rather
+# than silently produce a differently-behaved ewfmount.
+#
+# Keyed by version so overriding ``MOUNTIR_LIBEWF_VERSION`` doesn't check the
+# new tarball against the old digest. An unknown version is downloaded with a
+# loud warning instead of being blocked -- set ``MOUNTIR_LIBEWF_SHA256`` to
+# pin it, and add it here once you have verified it.
+LIBEWF_SHA256: Dict[str, str] = {
+    "20240506": "247d8ee9572392a2404be514d1137f099970f41f240c1134ddc3f04322281c67",
+}
 # The release tarball ships a pre-generated ``configure`` (no autotools needed).
 LIBEWF_BUILD_DEPS = [
     "gcc", "make", "pkg-config", "zlib1g-dev", "libbz2-dev",
@@ -754,18 +770,51 @@ def have_modern_libewf(minimum: str = LIBEWF_VERSION) -> bool:
         return False
 
 
-def _download(url: str, dest: Path, timeout: int = 180) -> bool:
-    """Download ``url`` to ``dest`` with urllib (follows redirects).  No raise."""
+def _download(url: str, dest: Path, timeout: int = 180,
+              sha256: str = "") -> bool:
+    """Download ``url`` to ``dest`` with urllib (follows redirects).  No raise.
+
+    When *sha256* is given the payload is verified before it is written, so a
+    mismatch leaves no tarball behind for a later step to pick up.
+    """
     import urllib.error
     import urllib.request
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:  # nosec B310 - https only
             data = resp.read()
-        dest.write_bytes(data)
-        return dest.stat().st_size > 0
     except (urllib.error.URLError, OSError, ValueError) as e:
         logger.warning("download failed for %s: %s", url, e)
         return False
+
+    if sha256:
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != sha256.lower():
+            logger.error(
+                "Checksum mismatch for %s\n  expected sha256 %s\n  actual   "
+                "sha256 %s\nRefusing to build from it.", url, sha256.lower(),
+                actual,
+            )
+            return False
+        logger.debug("verified sha256 of %s", dest.name)
+
+    try:
+        dest.write_bytes(data)
+    except OSError as e:
+        logger.warning("could not write %s: %s", dest, e)
+        return False
+    return dest.stat().st_size > 0
+
+
+def libewf_expected_sha256(version: str) -> str:
+    """Expected tarball digest for *version* (``""`` when we don't know one).
+
+    ``MOUNTIR_LIBEWF_SHA256`` overrides, so pinning a version MountIR has never
+    seen stays a one-liner rather than a code change.
+    """
+    override = os.environ.get("MOUNTIR_LIBEWF_SHA256", "").strip()
+    if override:
+        return override
+    return LIBEWF_SHA256.get(version, "")
 
 
 def _extract_tarball(tarball: Path, dest: Path) -> Optional[Path]:
@@ -774,11 +823,8 @@ def _extract_tarball(tarball: Path, dest: Path) -> Optional[Path]:
     try:
         with tarfile.open(tarball, "r:gz") as tf:
             names = tf.getnames()
-            try:
-                tf.extractall(dest, filter="data")  # safe extraction (py3.12+)
-            except TypeError:
-                tf.extractall(dest)  # older Python without the filter kwarg
-    except (tarfile.TarError, OSError) as e:
+            safe_extractall(tf, dest)
+    except (tarfile.TarError, OSError, ValueError) as e:
         logger.warning("could not extract %s: %s", tarball.name, e)
         return None
     tops = {n.split("/", 1)[0] for n in names if n and not n.startswith("/")}
@@ -875,9 +921,15 @@ def build_libewf(force: bool = False, version: str = "") -> bool:
 
     tarball = _SOURCE_BUILD_ROOT / f"libewf-{version}.tar.gz"
     src_dir = _SOURCE_BUILD_ROOT / f"libewf-{version}"
+    expected_sha = libewf_expected_sha256(version)
+    if not expected_sha:
+        logger.warning(
+            "No pinned sha256 for libewf %s - the download cannot be verified. "
+            "Set MOUNTIR_LIBEWF_SHA256 to pin it.", version,
+        )
     try:
         _SOURCE_BUILD_ROOT.mkdir(parents=True, exist_ok=True)
-        if not _download(url, tarball):
+        if not _download(url, tarball, sha256=expected_sha):
             logger.warning("Could not download libewf source from %s", url)
             return False
         # Always build from a pristine tree. Rebuilding over stale objects (e.g.

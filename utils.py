@@ -9,10 +9,11 @@ import shutil
 import string
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 try:
     from colorama import init, Fore, Style
@@ -81,6 +82,7 @@ def run_command(
     check: bool = True,
     timeout: int = 300,
     capture: bool = True,
+    log_cmd: Optional[List[str]] = None,
 ) -> subprocess.CompletedProcess:
     """Run an external command with logging.
 
@@ -90,8 +92,12 @@ def run_command(
     When *capture* is False, stdout and stderr are redirected to DEVNULL
     so the subprocess output doesn't leak to the console and no memory is
     wasted buffering it.
+
+    *log_cmd* substitutes what gets written to the log. Callers that pass a
+    secret on the command line (BitLocker credentials) use it to keep the secret
+    out of the on-disk log; it does not change what is executed.
     """
-    logger.debug("Running: %s", " ".join(cmd))
+    logger.debug("Running: %s", " ".join(log_cmd or cmd))
     try:
         if capture:
             result = subprocess.run(
@@ -111,7 +117,8 @@ def run_command(
         logger.error("Command not found: %s", cmd[0])
         raise
     except subprocess.TimeoutExpired:
-        logger.error("Command timed out after %ds: %s", timeout, " ".join(cmd))
+        logger.error("Command timed out after %ds: %s", timeout,
+                     " ".join(log_cmd or cmd))
         raise
 
     if result.returncode != 0:
@@ -149,13 +156,21 @@ def check_root() -> bool:
 # ---------------------------------------------------------------------------
 # Mount point helpers
 # ---------------------------------------------------------------------------
+MOUNT_ID_RANDOM_LEN = 6
+_MOUNT_ID_ALPHABET = string.ascii_lowercase + string.digits
+
+
 def generate_mount_id(case_id: Optional[str] = None,
-                      image_name: str = "") -> str:
-    """Generate a unique mount point directory name.
+                      image_name: str = "",
+                      random_len: int = MOUNT_ID_RANDOM_LEN) -> str:
+    """Generate a mount point directory name.
 
     Format: {case_id}_{image_stem}_{random6}  or  EV_{random6}
+
+    The suffix is random, not unique -- use :func:`claim_mount_dir` when the
+    name has to be free, since only creating the directory can settle that.
     """
-    rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    rand = "".join(random.choices(_MOUNT_ID_ALPHABET, k=random_len))
     # Sanitize inputs
     safe_case = re.sub(r"[^a-zA-Z0-9_-]", "", case_id or "")
     safe_name = re.sub(r"[^a-zA-Z0-9_-]", "", image_name)
@@ -172,23 +187,68 @@ def generate_mount_id(case_id: Optional[str] = None,
     return "_".join(parts)
 
 
+def claim_mount_dir(mount_base: Path, case_id: str = "",
+                    image_name: str = "") -> Tuple[str, Path]:
+    """Reserve a free mount directory under *mount_base*; return (id, path).
+
+    ``mkdir`` **is** the claim: it fails with ``FileExistsError`` if the name is
+    taken, so two MountIR processes racing on the same base cannot both win the
+    same id and mount into each other's tree. A generated id is 6 random
+    characters, so a collision means either bad luck or a very busy mount base;
+    the suffix is widened as attempts fail so the search converges instead of
+    retrying at the same odds.
+
+    Raises OSError if no free name could be claimed.
+    """
+    mount_base.mkdir(parents=True, exist_ok=True)
+    for attempt in range(9):
+        mount_id = generate_mount_id(
+            case_id, image_name,
+            random_len=MOUNT_ID_RANDOM_LEN + 2 * (attempt // 3),
+        )
+        path = mount_base / mount_id
+        try:
+            path.mkdir()
+        except FileExistsError:
+            logger.debug("Mount id %s is already in use, retrying", mount_id)
+            continue
+        return mount_id, path
+    raise OSError(f"Could not claim a free mount directory under {mount_base}")
+
+
 def ensure_mount_dir(path: Path) -> Path:
     """Create a directory for mounting, ensuring it exists and is empty."""
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
+def _rmdir_empty_tree(path: Path) -> None:
+    """Recursively rmdir empty directories under *path*, never entering a mount.
+
+    A still-mounted evidence volume under *path* must not be descended into: it
+    can hold millions of files, and walking it just to discover we cannot remove
+    anything costs minutes of I/O against the image. ``os.path.ismount`` prunes
+    those subtrees; symlinks are never followed.
+    """
+    try:
+        children = list(path.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if not child.is_dir() or child.is_symlink() or os.path.ismount(child):
+            continue
+        _rmdir_empty_tree(child)
+        try:
+            child.rmdir()
+        except OSError:
+            pass
+
+
 def cleanup_mount_dir(path: Path) -> None:
     """Remove an empty mount point directory tree."""
     try:
         if path.is_dir():
-            # Remove empty subdirectories first
-            for child in sorted(path.rglob("*"), reverse=True):
-                if child.is_dir():
-                    try:
-                        child.rmdir()
-                    except OSError:
-                        pass
+            _rmdir_empty_tree(path)
             try:
                 path.rmdir()
                 logger.debug("Removed mount directory: %s", path)
@@ -196,6 +256,72 @@ def cleanup_mount_dir(path: Path) -> None:
                 logger.debug("Directory not empty, skipping removal: %s", path)
     except Exception as e:
         logger.warning("Failed to clean up %s: %s", path, e)
+
+
+# ---------------------------------------------------------------------------
+# Scratch space for formats that must be materialised on disk
+# ---------------------------------------------------------------------------
+# Prefix for every temp dir MountIR creates, so `clean` can recognise its own
+# scratch and nothing else.
+SCRATCH_PREFIX = "mountir_"
+
+
+def make_scratch_dir(kind: str) -> Path:
+    """Create a scratch directory for a format that must be written out.
+
+    DMG conversion, OVA/XVA extraction and split-raw concatenation all
+    materialise a full-size copy of the evidence.  ``/tmp`` is a tmpfs (RAM) on
+    many hosts, so the default would OOM the box on any real image; honour
+    ``MOUNTIR_TMPDIR`` (then ``TMPDIR``) so the analyst can point the scratch at
+    a disk with room for it.
+    """
+    base = os.environ.get("MOUNTIR_TMPDIR") or None
+    if base:
+        Path(base).mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"{SCRATCH_PREFIX}{kind}_", dir=base))
+
+
+def is_scratch_dir(path: Path) -> bool:
+    """True when *path* is a MountIR scratch directory we may delete."""
+    return path.is_dir() and path.name.startswith(SCRATCH_PREFIX)
+
+
+def safe_extractall(tf, dest: Path) -> None:
+    """Extract a tarfile using the ``data`` filter (path-traversal safe).
+
+    Evidence containers (OVA/XVA) are untrusted input: a member named
+    ``../../etc/cron.d/x`` would otherwise be written outside *dest* by a tool
+    that runs as root.  Python 3.12+ implements this as ``filter="data"``;
+    older interpreters get an equivalent manual check.
+    """
+    try:
+        tf.extractall(dest, filter="data")
+        return
+    except TypeError:
+        pass  # Python < 3.12 (pre-backport): no filter kwarg
+
+    dest_resolved = dest.resolve()
+
+    def _inside(path: Path) -> bool:
+        resolved = Path(path).resolve()
+        return resolved == dest_resolved or dest_resolved in resolved.parents
+
+    for member in tf.getmembers():
+        target = dest / member.name
+        if not _inside(target):
+            raise ValueError(f"unsafe path in archive: {member.name}")
+        if not (member.issym() or member.islnk()):
+            continue
+        # A link that points outside *dest* is as dangerous as a bad path: a
+        # later member named "<link>/file" passes the check above and is then
+        # written through the link. Hardlink targets are archive-root relative,
+        # symlink targets are relative to the link's own directory.
+        link = member.linkname
+        base = dest if member.islnk() else target.parent
+        if Path(link).is_absolute() or not _inside(base / link):
+            raise ValueError(
+                f"unsafe link in archive: {member.name} -> {link}")
+    tf.extractall(dest)
 
 
 # ---------------------------------------------------------------------------
@@ -236,25 +362,62 @@ def ensure_nbd_module(max_part: int = 16) -> bool:
         return False
 
 
-def find_free_nbd_device() -> Optional[str]:
-    """Find an unused /dev/nbdN device.
+NBD_MAX_DEVICES = 16
 
-    Checks /sys/block/nbdN/size -- a size of 0 means unused.
-    Returns device path like '/dev/nbd0', or None if none available.
+
+def free_nbd_devices(max_devices: int = NBD_MAX_DEVICES) -> List[str]:
+    """Unused /dev/nbdN devices, in order.
+
+    Checks /sys/block/nbdN/size -- a size of 0 means unused. This is a snapshot,
+    not a reservation: see :func:`nbd_attach`.
     """
-    for i in range(16):
-        dev = f"/dev/nbd{i}"
+    devices = []
+    for i in range(max_devices):
         size_file = Path(f"/sys/block/nbd{i}/size")
         if not size_file.exists():
             continue
         try:
-            size = int(size_file.read_text().strip())
-            if size == 0:
-                logger.debug("Found free NBD device: %s", dev)
-                return dev
+            if int(size_file.read_text().strip()) == 0:
+                devices.append(f"/dev/nbd{i}")
         except (ValueError, OSError):
             continue
-    logger.error("No free NBD devices available")
+    return devices
+
+
+def nbd_attach(image_path: Path, read_only: bool = True,
+               format_hint: Optional[str] = None,
+               max_devices: int = NBD_MAX_DEVICES) -> Optional[str]:
+    """Attach *image_path* to a free NBD device; return the device, or None.
+
+    Picking a free device and then attaching to it is a race: two MountIR runs
+    scanning at the same time both see ``/dev/nbd0`` idle. Rather than guard it
+    with a lock -- which could not exclude other tools on the box anyway -- the
+    attach itself is the claim: ``qemu-nbd -c`` fails on a device that is
+    already connected, so a lost race just moves us to the next candidate.
+    Loading the nbd module is handled here too, since every caller needs it.
+    """
+    if not ensure_nbd_module():
+        logger.error("Failed to load nbd kernel module")
+        return None
+
+    candidates = free_nbd_devices(max_devices)
+    if not candidates:
+        logger.error("No free NBD devices available")
+        return None
+
+    for device in candidates:
+        if nbd_connect(image_path, device, read_only=read_only,
+                       format_hint=format_hint):
+            return device
+        logger.debug("%s was not available for %s, trying the next device",
+                     device, image_path.name)
+
+    logger.error(
+        "Could not attach %s to any of the %d free NBD device(s) tried - "
+        "another process may have taken them, or the image format was rejected "
+        "(check 'qemu-img info %s')",
+        image_path.name, len(candidates), image_path,
+    )
     return None
 
 
@@ -269,7 +432,9 @@ def nbd_connect(image_path: Path, nbd_device: str,
         read_only: Mount read-only (default True).
         format_hint: Image format ('vmdk', 'vpc', 'vhdx', 'qcow2').
 
-    Returns True on success.
+    Returns True on success. A failure is logged at DEBUG, not ERROR: callers
+    such as :func:`nbd_attach` try several devices in turn, and a device another
+    process claimed first is an expected miss rather than a problem to report.
     """
     cmd = ["qemu-nbd", f"--connect={nbd_device}"]
     if read_only:
@@ -279,9 +444,9 @@ def nbd_connect(image_path: Path, nbd_device: str,
     cmd.append(str(image_path))
 
     try:
-        run_command(cmd, capture=False)
-    except subprocess.CalledProcessError as e:
-        logger.error("qemu-nbd connect failed: %s", e)
+        run_command(cmd, capture=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.debug("qemu-nbd connect to %s failed: %s", nbd_device, e)
         return False
 
     # Wait for the device to become available
@@ -303,7 +468,7 @@ def nbd_connect(image_path: Path, nbd_device: str,
 def nbd_disconnect(nbd_device: str) -> bool:
     """Disconnect an NBD device."""
     try:
-        run_command(["qemu-nbd", f"--disconnect", nbd_device], capture=False)
+        run_command(["qemu-nbd", "--disconnect", nbd_device], capture=False)
         logger.debug("Disconnected NBD device: %s", nbd_device)
         return True
     except subprocess.CalledProcessError as e:

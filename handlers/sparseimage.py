@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Handler for macOS sparse images (.sparseimage / .sparsebundle)."""
 
-import tempfile
 from pathlib import Path
 from typing import List
 
 from handlers.base import BaseHandler, MountResult
-from utils import logger, run_command, fuse_unmount, tool_exists
+from utils import (
+    logger, run_command, fuse_unmount, tool_exists, make_scratch_dir,
+    SCRATCH_PREFIX,
+)
 
 
 class SparseImageHandler(BaseHandler):
@@ -111,7 +113,7 @@ class SparseImageHandler(BaseHandler):
         self, image_path: Path, mount_point: Path,
     ) -> MountResult:
         """Convert sparse image to raw with dmg2img, then loop-mount."""
-        temp_dir = Path(tempfile.mkdtemp(prefix="mountir_sparse_"))
+        temp_dir = make_scratch_dir("sparse")
         raw_path = temp_dir / f"{image_path.stem}.raw"
 
         try:
@@ -195,7 +197,7 @@ class SparseImageHandler(BaseHandler):
             try:
                 temp_dir = mount_result.raw_image_path.parent
                 # Only clean up if it's a temp file (not from FUSE mount)
-                if "mountir_sparse_" in str(temp_dir):
+                if temp_dir.name.startswith(f"{SCRATCH_PREFIX}sparse_"):
                     mount_result.raw_image_path.unlink()
                     logger.debug(
                         "Removed converted raw image: %s",

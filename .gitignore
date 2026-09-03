@@ -12,5 +12,6 @@ __pycache__/
 # MountIR runtime artifacts
 logs/
 mountir_state.json
+mountir_state.json.lock
 .mountir_bootstrapped
 *.log

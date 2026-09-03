@@ -5,9 +5,7 @@ from pathlib import Path
 from typing import List
 
 from handlers.base import BaseHandler, MountResult
-from utils import (
-    logger, run_command, fuse_unmount, run_fuse_mount, FUSE_ACCESS_OPTS,
-)
+from utils import logger, fuse_unmount, run_fuse_mount, FUSE_ACCESS_OPTS
 
 
 class AffHandler(BaseHandler):

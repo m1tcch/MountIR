@@ -7,13 +7,12 @@ This handler extracts the archive and delegates to VmdkHandler.
 
 import shutil
 import tarfile
-import tempfile
 from pathlib import Path
 from typing import List, Optional
 
 from handlers.base import BaseHandler, MountResult
 from handlers.vmdk import VmdkHandler
-from utils import logger
+from utils import logger, make_scratch_dir, safe_extractall
 
 
 class OvaHandler(BaseHandler):
@@ -77,12 +76,12 @@ class OvaHandler(BaseHandler):
             )
 
         # Extract to a temp directory
-        temp_dir = Path(tempfile.mkdtemp(prefix="mountir_ova_"))
+        temp_dir = make_scratch_dir("ova")
         try:
             with tarfile.open(image_path, "r") as tf:
-                tf.extractall(temp_dir)
+                safe_extractall(tf, temp_dir)
                 logger.debug("Extracted OVA to: %s", temp_dir)
-        except (tarfile.TarError, OSError) as e:
+        except (tarfile.TarError, OSError, ValueError) as e:
             shutil.rmtree(temp_dir, ignore_errors=True)
             return MountResult(success=False, error=f"OVA extraction failed: {e}")
 

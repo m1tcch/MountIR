@@ -2,12 +2,11 @@
 """Handler for macOS DMG (Apple Disk Image) files."""
 
 import platform
-import tempfile
 from pathlib import Path
 from typing import List
 
 from handlers.base import BaseHandler, MountResult
-from utils import logger, run_command, tool_exists
+from utils import logger, run_command, tool_exists, make_scratch_dir
 
 
 class DmgHandler(BaseHandler):
@@ -46,7 +45,7 @@ class DmgHandler(BaseHandler):
 
     def _mount_dmg2img(self, image_path: Path, mount_point: Path) -> MountResult:
         """Convert DMG to raw with dmg2img, then attach via losetup."""
-        temp_dir = Path(tempfile.mkdtemp(prefix="mountir_dmg_"))
+        temp_dir = make_scratch_dir("dmg")
         raw_path = temp_dir / f"{image_path.stem}.raw"
 
         try:

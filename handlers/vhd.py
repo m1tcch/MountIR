@@ -6,9 +6,9 @@ from typing import List
 
 from handlers.base import BaseHandler, MountResult
 from utils import (
-    logger, run_command, fuse_unmount, run_fuse_mount,
+    logger, fuse_unmount, run_fuse_mount,
     FUSE_ACCESS_OPTS_LIBYAL,
-    ensure_nbd_module, find_free_nbd_device, nbd_connect, nbd_disconnect,
+    nbd_attach, nbd_disconnect,
     tool_exists,
 )
 
@@ -49,25 +49,13 @@ class VhdHandler(BaseHandler):
 
     def _mount_nbd(self, image_path: Path) -> MountResult:
         """Mount via qemu-nbd."""
-        if not ensure_nbd_module():
-            return MountResult(
-                success=False,
-                error="Failed to load nbd kernel module",
-            )
-
-        device = find_free_nbd_device()
+        # VHD uses 'vpc' format in qemu, VHDX uses 'vhdx'
+        fmt = "vhdx" if self._is_vhdx else "vpc"
+        device = nbd_attach(image_path, format_hint=fmt)
         if not device:
             return MountResult(
                 success=False,
-                error="No free NBD device available",
-            )
-
-        # VHD uses 'vpc' format in qemu, VHDX uses 'vhdx'
-        fmt = "vhdx" if self._is_vhdx else "vpc"
-        if not nbd_connect(image_path, device, format_hint=fmt):
-            return MountResult(
-                success=False,
-                error=f"Failed to connect {image_path.name} to {device}",
+                error=f"Could not attach {image_path.name} to an NBD device",
             )
 
         logger.info("Mounted %s via qemu-nbd -> %s", image_path.name, device)

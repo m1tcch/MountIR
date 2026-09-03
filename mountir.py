@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -26,20 +27,22 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from utils import (
-    logger, setup_logging, check_root, generate_mount_id,
-    ensure_mount_dir, cleanup_mount_dir, format_bytes, run_command,
-    find_mounts_under, loop_devices_backing,
+    logger, setup_logging, check_root, claim_mount_dir,
+    ensure_mount_dir, cleanup_mount_dir, run_command, fuse_unmount,
+    find_mounts_under, loop_devices_backing, is_scratch_dir,
     Fore, Style, HAS_COLOR,
 )
 from detector import (
     ImageType, detect_image_type, find_images_in_dir, is_bundle_image,
     _is_secondary_segment, SUPPORTED_FORMATS, display_format,
 )
-from handlers import get_handler, ALL_HANDLER_CLASSES, NO_PARTITION_TYPES
+from handlers import get_handler, NO_PARTITION_TYPES
 from handlers.base import MountResult
+import partition
 from partition import (
-    expose_partitions, mount_partition, unmount_partitions,
+    expose_partitions, mount_partition,
     detect_lvm, activate_lvm, deactivate_lvm,
+    unlock_bitlocker, expose_shadow_copies,
     infer_os, kernel_filesystems, PartitionInfo, _enrich_with_blkid,
 )
 from state import StateManager, MountedImage, MountedPartition
@@ -165,11 +168,18 @@ def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
     if tool_status.get("fallback_in_use"):
         logger.info("Using fallback tools for %s", handler.format_name)
 
-    # Create mount hierarchy
+    # Create mount hierarchy. Claiming the directory (rather than just naming
+    # it) is what makes the mount id unique: creating it is an atomic test, so
+    # two concurrent runs can never mount into the same tree.
     mount_base = Path(args.mount_base)
     case_id = getattr(args, "case_id", None) or ""
-    mount_id = generate_mount_id(case_id, image_path.stem)
-    image_mount_dir = mount_base / mount_id
+    try:
+        mount_id, image_mount_dir = claim_mount_dir(
+            mount_base, case_id, image_path.stem)
+    except OSError as e:
+        logger.error("Could not create a mount point for %s: %s",
+                     image_path.name, e)
+        return None
     container_dir = image_mount_dir / "container"
     partitions_dir = image_mount_dir / "partitions"
 
@@ -185,10 +195,10 @@ def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
         return None
 
     # Track state for building the MountedImage
-    secondary_loop = ""
     partition_infos = []
     lvm_vg_names = []
     partition_loops = []  # per-partition offset loop devices we created
+    fuse_mounts = []  # nested FUSE views (BitLocker / VSS) to release on unmount
     zfs_pools = []  # ZFS pools we imported (exported on unmount)
 
     # Detect and mount partitions
@@ -205,7 +215,28 @@ def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
             str(result.raw_image_path) if result.raw_image_path else ""
         )
         if backing:
-            partition_infos, partition_loops = expose_partitions(backing, force=force)
+            partition_infos, partition_loops = expose_partitions(
+                backing, force=force, offset=getattr(args, "offset", None),
+            )
+
+            # A user-supplied filesystem type is a *fallback*, not an override:
+            # blkid's answer is evidence, the flag is a guess for the volumes it
+            # could not identify.
+            fs_override = getattr(args, "filesystem", None)
+            if fs_override:
+                for part in partition_infos:
+                    if not part.filesystem:
+                        logger.info("Assuming %s for %s (--filesystem)",
+                                    fs_override, part.device)
+                        part.filesystem = fs_override
+
+            # BitLocker volumes are decrypted into their own device before the
+            # mount loop below sees them.
+            bde = unlock_bitlocker(partition_infos, image_mount_dir,
+                                   _bitlocker_credentials(args))
+            partition_infos.extend(bde.partitions)
+            partition_loops.extend(bde.loops)
+            fuse_mounts.extend(bde.fuse_mounts)
 
             # LVM physical volumes may live on the exposed partition devices.
             part_devices = [p.device for p in partition_infos if p.device]
@@ -216,6 +247,14 @@ def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
                     lv_part = PartitionInfo(device=lv_path, number=200 + i)
                     _enrich_with_blkid(lv_part)
                     partition_infos.append(lv_part)
+
+        # Volume Shadow Copies: each store becomes another volume to mount.
+        if getattr(args, "vss", False):
+            for part in list(partition_infos):
+                shadows = expose_shadow_copies(part, image_mount_dir)
+                partition_infos.extend(shadows.partitions)
+                partition_loops.extend(shadows.loops)
+                fuse_mounts.extend(shadows.fuse_mounts)
 
         # Mount each partition
         for part in partition_infos:
@@ -244,8 +283,8 @@ def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
         container_mount=str(container_dir),
         block_device=result.block_device or "",
         loop_device=result.loop_device or "",
-        secondary_loop=secondary_loop,
         partition_loops=partition_loops,
+        fuse_mounts=fuse_mounts,
         raw_image_path=str(result.raw_image_path or ""),
         partitions=[
             MountedPartition(
@@ -375,6 +414,23 @@ def _import_zfs_pools(partition_infos, image_mount_dir: Path):
             ))
             number += 1
     return pool_names, dataset_infos
+
+
+def _bitlocker_credentials(args) -> list:
+    """Collect BitLocker credential flags for ``bdemount`` from the CLI/env.
+
+    ``MOUNTIR_BDE_PASSWORD`` / ``MOUNTIR_BDE_RECOVERY_KEY`` are honoured so the
+    secret need not appear in the process list, where any local user can read
+    it; the equivalent flags remain for interactive use.
+    """
+    return partition.bitlocker_credential_args(
+        password=getattr(args, "bde_password", "")
+                 or os.environ.get("MOUNTIR_BDE_PASSWORD", ""),
+        recovery_key=getattr(args, "bde_recovery_key", "")
+                     or os.environ.get("MOUNTIR_BDE_RECOVERY_KEY", ""),
+        startup_key=getattr(args, "bde_startup_key", ""),
+        full_volume_key=getattr(args, "bde_key", ""),
+    )
 
 
 def _partition_dir_name(part) -> str:
@@ -618,13 +674,12 @@ def _unmount_single(mounted: MountedImage, state_mgr: StateManager) -> bool:
         except Exception:
             pass
 
-    # 4. Detach secondary loop device (for FUSE raw images)
-    if mounted.secondary_loop:
-        try:
-            run_command(["losetup", "-d", mounted.secondary_loop], check=False, capture=False)
-            logger.debug("Detached secondary loop: %s", mounted.secondary_loop)
-        except Exception:
-            pass
+    # 4. Release nested FUSE views (BitLocker plaintext, VSS stores). The loops
+    #    above were windowed onto files inside these mounts, so they had to go
+    #    first.
+    for fuse_mount in reversed(getattr(mounted, "fuse_mounts", []) or []):
+        if not fuse_unmount(Path(fuse_mount)):
+            all_ok = False
 
     # 5. Unmount container
     try:
@@ -634,6 +689,10 @@ def _unmount_single(mounted: MountedImage, state_mgr: StateManager) -> bool:
             mount_point=Path(mounted.container_mount) if mounted.container_mount else None,
             block_device=mounted.block_device or None,
             loop_device=mounted.loop_device or None,
+            # OVA/XVA/DMG/split-raw stash their scratch path here at mount time
+            # and delete it in unmount(); dropping it leaks a full-size copy of
+            # the evidence for every such image ever mounted.
+            raw_image_path=Path(mounted.raw_image_path) if mounted.raw_image_path else None,
         )
         if handler.unmount(container_result) is False:
             all_ok = False
@@ -776,6 +835,9 @@ def cmd_check(args):
         ("pvs", "lvm2", "LVM detection"),
         ("fusermount", "fuse", "FUSE unmounting"),
         ("file", "file (built-in)", "Image type detection"),
+        ("bdemount", "libbde-utils", "BitLocker volume unlocking"),
+        ("vshadowmount", "libvshadow-utils", "Volume Shadow Copies (--vss)"),
+        ("affuse", "afflib-tools", "AFF and split-raw without copying"),
     ]
 
     # Filesystem drivers: (label, helper-binary-or-None, install hint,
@@ -898,7 +960,7 @@ def cmd_check(args):
             print(f"  {'':26} (or a kernel providing '{kernel_name}')",
                   file=sys.stderr)
 
-    print(f"\n  Run 'mountir setup' to install everything automatically.\n",
+    print("\n  Run 'mountir setup' to install everything automatically.\n",
           file=sys.stderr)
 
 
@@ -948,14 +1010,20 @@ def cmd_clean(args):
     # immune to the mangling).
     loops_to_detach = set(loop_devices_backing(base))
     pools_to_export = set()
+    scratch_to_remove = set()
     base_str = str(base)
     for img in state_mgr.load().mounted_images:
         mb = str(img.mount_base or "")
         if mb == base_str or mb.startswith(f"{base_str}/"):
             loops_to_detach.update(img.partition_loops or [])
-            if img.secondary_loop:
-                loops_to_detach.add(img.secondary_loop)
             pools_to_export.update(getattr(img, "zfs_pools", []) or [])
+            # OVA/XVA/DMG/split-raw materialise the evidence in a scratch dir
+            # outside the mount base; without this it survives the clean.
+            if img.raw_image_path:
+                scratch = Path(img.raw_image_path)
+                scratch = scratch if scratch.is_dir() else scratch.parent
+                if is_scratch_dir(scratch):
+                    scratch_to_remove.add(scratch)
 
     # 0. Export ZFS pools first: a plain umount of a dataset leaves the pool
     #    imported and its vdev loops held, so detaching them would fail.
@@ -981,6 +1049,14 @@ def cmd_clean(args):
     for child in sorted(base.iterdir()):
         if child.is_dir():
             cleanup_mount_dir(child)
+
+    # 3b. Delete the scratch copies those mounts were reading from.
+    for scratch in sorted(scratch_to_remove):
+        try:
+            shutil.rmtree(scratch)
+            logger.info("Removed scratch directory: %s", scratch)
+        except OSError as e:
+            logger.warning("Could not remove scratch directory %s: %s", scratch, e)
 
     # 4. Prune state entries that are no longer actually mounted.
     for stale in state_mgr.verify_mounts():
@@ -1019,6 +1095,25 @@ def cmd_install_deps(args):
 # ---------------------------------------------------------------------------
 # CLI argument parser
 # ---------------------------------------------------------------------------
+_OFFSET_UNITS = {"": 1, "s": 512, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
+
+
+def _byte_offset(text: str) -> int:
+    """Parse a ``--offset`` value: plain bytes, ``<n>s`` sectors, or K/M/G.
+
+    Partition offsets are quoted in 512-byte sectors by fdisk and in bytes by
+    mount(8), and getting the conversion wrong silently mounts the wrong place,
+    so both spellings are accepted explicitly.
+    """
+    raw = text.strip().lower().replace("_", "")
+    match = re.fullmatch(r"(\d+)\s*([skmg]?)b?", raw)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"invalid offset {text!r}: use bytes (1048576), sectors (2048s), "
+            f"or a K/M/G suffix")
+    return int(match.group(1)) * _OFFSET_UNITS[match.group(2)]
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
@@ -1062,6 +1157,39 @@ def build_parser() -> argparse.ArgumentParser:
              "whole disk) and brute-force the filesystem type regardless of OS",
     )
     mount_parser.add_argument(
+        "-f", "--filesystem", metavar="TYPE",
+        help="Filesystem type to assume for volumes blkid cannot identify "
+             "(e.g. ntfs, ext4, vfat, exfat, hfsplus, ufs). Detected types "
+             "always win",
+    )
+    mount_parser.add_argument(
+        "-o", "--offset", type=_byte_offset, metavar="BYTES",
+        help="Skip the partition table and expose one volume starting at this "
+             "byte offset (accepts 63s / 2048s for sectors, and K/M/G suffixes)",
+    )
+    mount_parser.add_argument(
+        "--vss", action="store_true",
+        help="Also expose Volume Shadow Copies found on NTFS volumes "
+             "(needs libvshadow-utils)",
+    )
+    mount_parser.add_argument(
+        "--bde-password", default="", metavar="PASSWORD",
+        help="BitLocker password (prefer MOUNTIR_BDE_PASSWORD: an argument is "
+             "visible to every local user in the process list)",
+    )
+    mount_parser.add_argument(
+        "--bde-recovery-key", default="", metavar="KEY",
+        help="BitLocker 48-digit recovery key (or MOUNTIR_BDE_RECOVERY_KEY)",
+    )
+    mount_parser.add_argument(
+        "--bde-startup-key", default="", metavar="FILE",
+        help="BitLocker startup key (.BEK) file",
+    )
+    mount_parser.add_argument(
+        "--bde-key", default="", metavar="HEX",
+        help="BitLocker full volume encryption key and tweak key, in hex",
+    )
+    mount_parser.add_argument(
         "--case-id", default="",
         help="Case identifier (used in mount point naming)",
     )
@@ -1088,8 +1216,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Unmount all mounted images",
     )
     unmount_parser.add_argument("-v", "--verbose", action="store_true")
-    unmount_parser.add_argument("--json", action="store_true",
-                                 help="Output results as JSON")
 
     # --- list ---
     list_parser = subparsers.add_parser("list", help="List mounted images")

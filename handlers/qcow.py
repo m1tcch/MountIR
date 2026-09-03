@@ -7,7 +7,7 @@ from typing import List
 from handlers.base import BaseHandler, MountResult
 from utils import (
     logger,
-    ensure_nbd_module, find_free_nbd_device, nbd_connect, nbd_disconnect,
+    nbd_attach, nbd_disconnect,
 )
 
 
@@ -24,23 +24,11 @@ class QcowHandler(BaseHandler):
 
     def mount(self, image_path: Path, mount_point: Path) -> MountResult:
         """Mount QCOW2 image via qemu-nbd -> /dev/nbdN."""
-        if not ensure_nbd_module():
-            return MountResult(
-                success=False,
-                error="Failed to load nbd kernel module",
-            )
-
-        device = find_free_nbd_device()
+        device = nbd_attach(image_path, format_hint="qcow2")
         if not device:
             return MountResult(
                 success=False,
-                error="No free NBD device available",
-            )
-
-        if not nbd_connect(image_path, device, format_hint="qcow2"):
-            return MountResult(
-                success=False,
-                error=f"Failed to connect {image_path.name} to {device}",
+                error=f"Could not attach {image_path.name} to an NBD device",
             )
 
         logger.info("Mounted %s via qemu-nbd -> %s", image_path.name, device)

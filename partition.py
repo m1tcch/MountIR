@@ -33,7 +33,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Union
 
-from utils import logger, run_command, ensure_mount_dir, tool_exists
+from utils import (
+    logger, run_command, ensure_mount_dir, tool_exists, fuse_unmount,
+    run_fuse_mount, FUSE_ACCESS_OPTS_LIBYAL,
+)
 
 # partx/sfdisk report partition START in 512-byte units regardless of the
 # drive's logical sector size; sfdisk additionally prints an explicit
@@ -70,7 +73,9 @@ class PartitionInfo:
 
 # Forensic mount options per filesystem type
 _MOUNT_OPTIONS: Dict[str, str] = {
-    "ntfs":  "ro,noatime,noexec,show_sys_files,streams_interface=windows",
+    # ``norecover`` keeps ntfs-3g from replaying $LogFile: journal replay is a
+    # write to the evidence, and on a read-only device it just aborts the mount.
+    "ntfs":  "ro,noatime,noexec,norecover,show_sys_files,streams_interface=windows",
     "ext2":  "ro,noatime,noexec,norecovery",
     "ext3":  "ro,noatime,noexec,norecovery",
     "ext4":  "ro,noatime,noexec,norecovery",
@@ -654,8 +659,35 @@ def _expose_whole_disk(backing: str, backing_is_dev: bool, disk_size: int,
     return [vol], created
 
 
-def expose_partitions(backing: Union[str, Path],
-                      force: bool = False) -> Tuple[List[PartitionInfo], List[str]]:
+def _expose_at_offset(backing: str, disk_size: int, offset: int,
+                      created: List[str]) -> Tuple[List[PartitionInfo], List[str]]:
+    """Expose one volume starting at a manually-supplied byte offset.
+
+    The analyst's escape hatch (EverReady's ``-o``) for a disk whose partition
+    table is destroyed or unreadable but whose volume start is known -- e.g.
+    from a carving tool or a sector offset read out of ``fdisk`` by hand.
+    """
+    if disk_size > 0 and offset >= disk_size:
+        logger.error("Offset %d is past the end of %s (%d bytes)",
+                     offset, backing, disk_size)
+        return [], created
+    size = disk_size - offset if disk_size > 0 else 0
+    loop = _attach_offset_loop(backing, offset, size)
+    if not loop:
+        logger.error("Could not expose %s at offset %d", backing, offset)
+        return [], created
+    created.append(loop)
+    vol = PartitionInfo(device=loop, number=1, start_bytes=offset,
+                        size_bytes=size, backing_loop=loop)
+    _enrich_with_blkid(vol)
+    logger.info("Exposed %s at manual offset %d -> %s (%s)", backing, offset,
+                loop, vol.filesystem or "filesystem not identified")
+    return [vol], created
+
+
+def expose_partitions(backing: Union[str, Path], force: bool = False,
+                      offset: Optional[int] = None,
+                      ) -> Tuple[List[PartitionInfo], List[str]]:
     """Read *backing*'s partition table and expose each partition as a device.
 
     *backing* may be a block device (``/dev/loopN``, ``/dev/nbdN``) or an image
@@ -668,6 +700,9 @@ def expose_partitions(backing: Union[str, Path],
     filesystem) is found, the entire backing is exposed as a single device so a
     corrupt-table or unfamiliar disk can still be mounted/carved.
 
+    When *offset* is given the partition table is not consulted at all: one
+    volume is exposed from that byte offset to the end of the media.
+
     Returns ``(partitions, created_loop_devices)`` where ``created_loop_devices``
     are the offset loops we attached and must detach on unmount.
     """
@@ -675,6 +710,10 @@ def expose_partitions(backing: Union[str, Path],
     created: List[str] = []
     backing_is_dev = _is_block_device(backing)
     disk_size = _backing_size(backing)
+
+    # 0. Manual offset: the analyst overrides detection entirely.
+    if offset is not None:
+        return _expose_at_offset(backing, disk_size, offset, created)
 
     # 1. Single-volume image: a filesystem occupies the whole backing with no
     #    partition table (e.g. a forensic image of one NTFS/ext4 volume). Mount
@@ -739,31 +778,6 @@ def expose_partitions(backing: Union[str, Path],
             p.skip_reason = _nonfs_partition_kind(p)
 
     return valid, created
-
-
-# Back-compat wrappers ------------------------------------------------------
-def detect_partitions(block_device: str) -> List[PartitionInfo]:
-    """Expose partitions on an existing block device (drops created-loop list).
-
-    Prefer :func:`expose_partitions` when you need to clean up offset loops.
-    """
-    parts, _created = expose_partitions(block_device)
-    return parts
-
-
-def detect_partitions_from_raw(
-    raw_image_path: Path,
-    mount_base: Optional[Path] = None,
-) -> Tuple[List[PartitionInfo], List[str]]:
-    """Expose partitions from a FUSE-exposed raw image (ewf1, vmdk1, ...).
-
-    Reads the partition table directly from the raw image and windows each
-    partition with its own read-only offset loop device -- no whole-disk loop
-    or kernel partition scanning required.
-
-    Returns ``(partitions, created_loop_devices)``.
-    """
-    return expose_partitions(raw_image_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1032,7 +1046,7 @@ def _dmesg_hint(device: str) -> str:
 # the mount; the nicer forensic options were already tried by the normal path.
 _FORCE_TYPE_SWEEP: List[Tuple[Optional[str], str]] = [
     ("ntfs3", "ro"),
-    ("ntfs-3g", "ro,force,show_sys_files,streams_interface=windows"),
+    ("ntfs-3g", "ro,force,norecover,show_sys_files,streams_interface=windows"),
     ("ntfs", "ro"),
     ("ext4", "ro,norecovery"),
     ("ext3", "ro,norecovery"),
@@ -1083,7 +1097,7 @@ def _mount_attempts_base(fs: str) -> List[Tuple[Optional[str], str]]:
         # legacy read-only `ntfs`. Try each with options it actually accepts.
         return [
             ("ntfs3", "ro,noatime,noexec"),
-            ("ntfs-3g", "ro,noatime,noexec,show_sys_files,streams_interface=windows"),
+            ("ntfs-3g", _MOUNT_OPTIONS["ntfs"]),
             ("ntfs", "ro,noatime,noexec"),
             auto,
         ]
@@ -1322,35 +1336,258 @@ def infer_os(partitions: List[PartitionInfo]) -> str:
     return "Unknown"
 
 
-def unmount_partitions(partitions: List[PartitionInfo]) -> int:
-    """Unmount all partitions in reverse order.
+# ---------------------------------------------------------------------------
+# BitLocker (libbde)
+# ---------------------------------------------------------------------------
+# blkid reports a BitLocker volume as TYPE="BitLocker"; we lowercase every
+# detected type, and older libblkid builds say "bde" instead.
+BITLOCKER_FS_TYPES = {"bitlocker", "bde"}
 
-    Returns:
-        Count of failures.
+# Numbering base for the plaintext volumes we surface behind a BitLocker
+# container, keeping them clear of real partition numbers (and of the 200/300
+# ranges already used for LVM logical volumes and ZFS datasets).
+_BDE_NUMBER_BASE = 400
+_VSS_NUMBER_BASE = 500
+
+
+@dataclass
+class UnlockedVolumes:
+    """Volumes surfaced behind a container (BitLocker/VSS) plus their cleanup.
+
+    ``fuse_mounts`` and ``loops`` must be released on unmount, innermost first:
+    the loop devices are backed by files living inside the FUSE mounts.
     """
-    failures = 0
-    for part in reversed(partitions):
-        if not part.mounted or not part.mount_point:
-            continue
+    partitions: List[PartitionInfo] = field(default_factory=list)
+    fuse_mounts: List[str] = field(default_factory=list)
+    loops: List[str] = field(default_factory=list)
+
+
+def bitlocker_credential_args(password: str = "", recovery_key: str = "",
+                              startup_key: str = "",
+                              full_volume_key: str = "") -> List[str]:
+    """Build the ``bdemount`` credential flags for whatever was supplied."""
+    args: List[str] = []
+    if password:
+        args += ["-p", password]
+    if recovery_key:
+        args += ["-r", recovery_key]
+    if startup_key:
+        args += ["-s", startup_key]
+    if full_volume_key:
+        args += ["-k", full_volume_key]
+    return args
+
+
+def _redacted(args: List[str]) -> List[str]:
+    """Copy of *args* with credential values replaced, safe to log."""
+    out = list(args)
+    for i, token in enumerate(out[:-1]):
+        if token in ("-p", "-r", "-k"):
+            out[i + 1] = "<redacted>"
+    return out
+
+
+def unlock_bitlocker(partitions: List[PartitionInfo], work_dir: Path,
+                     credential_args: List[str]) -> UnlockedVolumes:
+    """Unlock BitLocker volumes among *partitions* with ``bdemount``.
+
+    Mirrors EverReady's ``ermount.sh -b``: each locked volume is decrypted into
+    a FUSE view (``bde1``) that is then windowed by a read-only loop device, so
+    the plaintext volume becomes an ordinary partition the caller can mount.
+    The ciphertext image itself is never written to.
+
+    Locked volumes are left with a ``skip_reason`` explaining what is missing
+    (no credential, no ``bdemount``, wrong key) rather than being reported as
+    mount failures.  Returns the plaintext volumes plus the FUSE mounts and loop
+    devices that have to be released on unmount.
+    """
+    result = UnlockedVolumes()
+    locked = [p for p in partitions if p.filesystem in BITLOCKER_FS_TYPES]
+    if not locked:
+        return result
+
+    if not credential_args:
+        for part in locked:
+            part.skip_reason = (
+                "BitLocker (locked - supply --bde-password, "
+                "--bde-recovery-key or --bde-startup-key)")
+            logger.warning("%s is BitLocker-encrypted and no credential was "
+                           "supplied - leaving it locked", part.device)
+        return result
+
+    if not tool_exists("bdemount"):
+        for part in locked:
+            part.skip_reason = "BitLocker (bdemount not installed - apt install libbde-utils)"
+            logger.error("%s is BitLocker-encrypted but bdemount is not "
+                         "installed (apt install libbde-utils)", part.device)
+        return result
+
+    for index, part in enumerate(locked):
+        target = work_dir / f"bde_p{part.number}"
+        ensure_mount_dir(target)
+        cmd = ["bdemount", *credential_args, part.device, str(target)]
         try:
-            run_command(["umount", str(part.mount_point)], capture=False)
-            part.mounted = False
-            logger.info("Unmounted partition: %s", part.mount_point)
-        except Exception as e:
-            logger.error("Failed to unmount %s: %s", part.mount_point, e)
-            failures += 1
-    return failures
+            run_command(cmd, capture=True, log_cmd=_redacted(cmd))
+        except Exception:
+            # The exception text repeats the argv (credential included), so it
+            # is deliberately not interpolated into the message.
+            part.skip_reason = "BitLocker (bdemount rejected the credential)"
+            logger.error("bdemount could not unlock %s - check the password / "
+                         "recovery key", part.device)
+            cleanup_mount_dir_quietly(target)
+            continue
+
+        raw = target / "bde1"
+        if not raw.exists():
+            part.skip_reason = "BitLocker (bdemount exposed no volume)"
+            logger.error("bdemount produced no bde1 for %s", part.device)
+            fuse_unmount(target)
+            continue
+
+        result.fuse_mounts.append(str(target))
+        loop = _attach_offset_loop(str(raw), 0, 0)
+        if not loop:
+            part.skip_reason = "BitLocker (could not expose the plaintext volume)"
+            continue
+        result.loops.append(loop)
+
+        plain = PartitionInfo(
+            device=loop,
+            number=_BDE_NUMBER_BASE + index,
+            start_bytes=part.start_bytes,
+            size_bytes=part.size_bytes,
+            label=part.label,
+            backing_loop=loop,
+        )
+        _enrich_with_blkid(plain)
+        part.skip_reason = f"BitLocker container (unlocked as {loop})"
+        logger.info("Unlocked BitLocker volume %s -> %s (%s)",
+                    part.device, loop, plain.filesystem or "unknown fs")
+        result.partitions.append(plain)
+
+    return result
+
+
+def cleanup_mount_dir_quietly(path: Path) -> None:
+    """rmdir *path* if it is empty, ignoring every failure."""
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Volume Shadow Copies (libvshadow)
+# ---------------------------------------------------------------------------
+_VSS_STORES_RE = re.compile(r"Number of stores:\s*(\d+)")
+
+
+def shadow_copy_count(device: str) -> int:
+    """Number of VSS stores on *device* (0 when none / vshadowinfo missing)."""
+    if not tool_exists("vshadowinfo"):
+        return 0
+    try:
+        result = run_command(["vshadowinfo", device], check=False, timeout=60)
+    except Exception as e:
+        logger.debug("vshadowinfo failed on %s: %s", device, e)
+        return 0
+    match = _VSS_STORES_RE.search(result.stdout or "")
+    return int(match.group(1)) if match else 0
+
+
+def expose_shadow_copies(partition: PartitionInfo,
+                         work_dir: Path) -> UnlockedVolumes:
+    """Expose each Volume Shadow Copy on an NTFS *partition* as its own device.
+
+    Mirrors EverReady's ``ermount.sh`` VSS support: ``vshadowmount`` presents
+    every store as a file (``vss1``, ``vss2``, ...) which we window with a
+    read-only loop device so the caller can mount it like any other NTFS volume.
+    Returns empty when the volume has no stores or libvshadow isn't installed.
+    """
+    result = UnlockedVolumes()
+    stores = shadow_copy_count(partition.device)
+    if stores <= 0:
+        return result
+    if not tool_exists("vshadowmount"):
+        logger.warning(
+            "%s has %d volume shadow cop%s but vshadowmount is not installed "
+            "(apt install libvshadow-utils)",
+            partition.device, stores, "y" if stores == 1 else "ies")
+        return result
+
+    target = work_dir / f"vss_p{partition.number}"
+    ensure_mount_dir(target)
+    try:
+        run_fuse_mount(["vshadowmount", partition.device, str(target)],
+                       FUSE_ACCESS_OPTS_LIBYAL, capture=True)
+    except Exception as e:
+        logger.warning("vshadowmount failed on %s: %s", partition.device, e)
+        cleanup_mount_dir_quietly(target)
+        return result
+
+    stores_found = sorted(
+        (p for p in target.iterdir() if p.name.startswith("vss")),
+        key=lambda p: int(p.name[3:]) if p.name[3:].isdigit() else 0,
+    )
+    if not stores_found:
+        logger.warning("vshadowmount exposed no stores for %s", partition.device)
+        fuse_unmount(target)
+        return result
+
+    result.fuse_mounts.append(str(target))
+    logger.info("Exposed %d volume shadow cop%s from %s",
+                len(stores_found), "y" if len(stores_found) == 1 else "ies",
+                partition.device)
+
+    for index, store in enumerate(stores_found):
+        loop = _attach_offset_loop(str(store), 0, 0)
+        if not loop:
+            logger.warning("Could not expose shadow copy %s", store.name)
+            continue
+        result.loops.append(loop)
+        snapshot = PartitionInfo(
+            device=loop,
+            number=_VSS_NUMBER_BASE + partition.number * 10 + index,
+            label=f"{partition.label or 'volume'}-{store.name}",
+            backing_loop=loop,
+        )
+        _enrich_with_blkid(snapshot)
+        if not snapshot.filesystem:
+            snapshot.filesystem = partition.filesystem or "ntfs"
+        result.partitions.append(snapshot)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
 # LVM
 # ---------------------------------------------------------------------------
+# A PV on a whole-disk device we exposed appears as that device plus a kernel
+# partition suffix (``/dev/nbd0`` -> ``/dev/nbd0p1``). Requiring the ``p<N>``
+# separator is what keeps ``/dev/loop1`` from also claiming ``/dev/loop12`` --
+# a bare prefix test would let an unrelated volume group on the analyst's own
+# host be activated here and deactivated again on unmount.
+_PV_PARTITION_SUFFIX_RE = re.compile(r"p\d+$")
+
+
+def _pv_on_devices(pv_name: str, device_set: Set[str]) -> bool:
+    """True when *pv_name* is one of *device_set* or a partition of one."""
+    if pv_name in device_set:
+        return True
+    return any(
+        pv_name.startswith(dev) and _PV_PARTITION_SUFFIX_RE.fullmatch(
+            pv_name[len(dev):])
+        for dev in device_set
+    )
+
+
 def detect_lvm(devices: Union[str, List[str]]) -> List[str]:
     """Detect LVM volume groups whose physical volumes live on *devices*.
 
     Accepts a single device path or a list (e.g. the offset loop devices we
-    created for each partition).  Matches a PV either exactly or by prefix (so a
-    whole-disk device still matches its partition PVs).
+    created for each partition).  A PV matches when it *is* one of the devices
+    or is a kernel partition node of one; unrelated volume groups on the
+    analyst's host are never claimed.
 
     Returns:
         List of volume group names found.
@@ -1373,10 +1610,7 @@ def detect_lvm(devices: Union[str, List[str]]) -> List[str]:
             if len(parts) < 2:
                 continue
             pv_name, vg_name = parts[0], parts[1]
-            matched = pv_name in device_set or any(
-                pv_name.startswith(d) for d in device_set
-            )
-            if matched and vg_name and vg_name not in vg_names:
+            if _pv_on_devices(pv_name, device_set) and vg_name and vg_name not in vg_names:
                 vg_names.append(vg_name)
                 logger.info("Found LVM volume group: %s on %s", vg_name, pv_name)
     except FileNotFoundError:

@@ -73,7 +73,7 @@ class TestUnmountExportsPoolsFirst:
         return MountedImage(
             mount_id="EV_z", image_path="/ev/pool.E01", image_type="e01",
             mount_base="/mnt/mountir", container_mount="/mnt/mountir/EV_z/container",
-            secondary_loop="", partition_loops=[],
+            partition_loops=[],
             zfs_pools=["tank"],
             partitions=[
                 MountedPartition(device="tank", number=300, filesystem="zfs",

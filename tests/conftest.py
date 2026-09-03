@@ -45,7 +45,6 @@ def tmp_state_file_with_data(tmp_state_file):
                 "container_mount": "/mnt/mountir/EV_abc123/container",
                 "block_device": "",
                 "loop_device": "",
-                "secondary_loop": "/dev/loop1",
                 "raw_image_path": "/mnt/mountir/EV_abc123/container/ewf1",
                 "partitions": [
                     {
