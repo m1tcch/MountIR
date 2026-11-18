@@ -509,6 +509,10 @@ def find_mounts_under(base: Path, proc_mounts: Optional[str] = None) -> List[str
 def loop_devices_backing(base: Path, losetup_output: Optional[str] = None) -> List[str]:
     """Return loop devices whose backing file lives under *base*.
 
+    Loops stacked on one of those loops are included too, transitively: an LVM
+    logical volume is exposed as an offset loop over its PV's loop device, so
+    its backing "file" is ``/dev/loopN`` rather than a path under *base*.
+
     Parses `losetup -a` (or *losetup_output* when provided, for testing).
     """
     base_str = str(base).replace("\\", "/").rstrip("/")
@@ -524,14 +528,23 @@ def loop_devices_backing(base: Path, losetup_output: Optional[str] = None) -> Li
 
     # e.g.  /dev/loop3: [2049]:131 (/mnt/mountir/<id>/container/ewf1)
     # Offset loops add a suffix:  ... (/path/ewf1), offset 1048576, sizelimit N
+    backing = {}
     for line in losetup_output.splitlines():
         m = re.match(r"^(/dev/loop\d+):\s.*?\((.+?)\)\s*(?:,.*)?$", line.strip())
-        if not m:
-            continue
-        dev, backfile = m.group(1), m.group(2)
+        if m:
+            backing[m.group(1)] = m.group(2)
+    for dev, backfile in backing.items():
         if backfile == base_str or backfile.startswith(base_str + "/"):
             devices.append(dev)
-    return devices
+    # Each pass adds one layer of stacking; stop when a pass adds nothing.
+    found = set(devices)
+    while True:
+        stacked = [dev for dev, backfile in backing.items()
+                   if backfile in found and dev not in found]
+        if not stacked:
+            return devices
+        devices.extend(stacked)
+        found.update(stacked)
 
 
 # A FUSE mount is visible only to the UID that created it unless ``allow_other``

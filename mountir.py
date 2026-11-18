@@ -41,11 +41,11 @@ from handlers.base import MountResult
 import partition
 from partition import (
     expose_partitions, mount_partition,
-    detect_lvm, activate_lvm, deactivate_lvm,
     unlock_bitlocker, expose_shadow_copies,
-    infer_os, kernel_filesystems, PartitionInfo, _enrich_with_blkid,
+    infer_os, kernel_filesystems, PartitionInfo,
 )
 from state import StateManager, MountedImage, MountedPartition
+import lvm
 import zfs
 import bootstrap
 
@@ -196,7 +196,7 @@ def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
 
     # Track state for building the MountedImage
     partition_infos = []
-    lvm_vg_names = []
+    lvm_exposure = lvm.LvmExposure()
     partition_loops = []  # per-partition offset loop devices we created
     fuse_mounts = []  # nested FUSE views (BitLocker / VSS) to release on unmount
     zfs_pools = []  # ZFS pools we imported (exported on unmount)
@@ -239,14 +239,10 @@ def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
             fuse_mounts.extend(bde.fuse_mounts)
 
             # LVM physical volumes may live on the exposed partition devices.
-            part_devices = [p.device for p in partition_infos if p.device]
-            lvm_vg_names = detect_lvm(part_devices)
-            if lvm_vg_names:
-                lv_paths = activate_lvm(lvm_vg_names)
-                for i, lv_path in enumerate(lv_paths):
-                    lv_part = PartitionInfo(device=lv_path, number=200 + i)
-                    _enrich_with_blkid(lv_part)
-                    partition_infos.append(lv_part)
+            # Each LV is exposed read-only without touching host LVM state.
+            lvm_exposure = lvm.expose_logical_volumes(partition_infos, mount_id)
+            partition_infos.extend(lvm_exposure.partitions)
+            partition_loops.extend(lvm_exposure.loops)
 
         # Volume Shadow Copies: each store becomes another volume to mount.
         if getattr(args, "vss", False):
@@ -298,7 +294,9 @@ def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
             )
             for p in partition_infos
         ],
-        lvm_vg_names=lvm_vg_names,
+        lvm_vg_names=[vg["name"] for vg in lvm_exposure.vgs],
+        lvm_vgs=lvm_exposure.vgs,
+        lvm_dm_devices=lvm_exposure.dm_devices,
         zfs_pools=zfs_pools,
         mounted_at=datetime.now().isoformat(),
         handler_class=handler.__class__.__name__,
@@ -660,9 +658,21 @@ def _unmount_single(mounted: MountedImage, state_mgr: StateManager) -> bool:
             if not _umount_path(part.mount_point):
                 all_ok = False
 
-    # 2. Deactivate LVM
-    if mounted.lvm_vg_names:
-        deactivate_lvm(mounted.lvm_vg_names)
+    # 2. Release LVM: our private dm tables and any read-only activations. Only
+    #    devices of *this* image's VGs are touched -- a host VG with the same
+    #    name is never visible to these commands.
+    lvm_vgs = getattr(mounted, "lvm_vgs", []) or []
+    lvm_dm = getattr(mounted, "lvm_dm_devices", []) or []
+    if lvm_vgs or lvm_dm:
+        if not lvm.teardown(lvm_dm, lvm_vgs):
+            all_ok = False
+    elif mounted.lvm_vg_names:
+        # State written by an older MountIR, which activated by bare VG name.
+        lvm.deactivate_legacy(
+            mounted.lvm_vg_names,
+            list(getattr(mounted, "partition_loops", []) or [])
+            + [d for d in (mounted.block_device, mounted.loop_device) if d]
+            + [p.device for p in mounted.partitions if p.device])
 
     # 3. Detach per-partition offset loop devices (reverse order). These are
     #    backed by the raw image / whole-disk loop, so release them before the
@@ -833,6 +843,7 @@ def cmd_check(args):
         ("blkid", "util-linux (built-in)", "Filesystem identification"),
         ("kpartx", "kpartx", "Partition mapping"),
         ("pvs", "lvm2", "LVM detection"),
+        ("dmsetup", "dmsetup", "Fragmented/striped/thin LVs"),
         ("fusermount", "fuse", "FUSE unmounting"),
         ("file", "file (built-in)", "Image type detection"),
         ("bdemount", "libbde-utils", "BitLocker volume unlocking"),
@@ -972,6 +983,11 @@ _PROTECTED_BASES = {
 }
 
 
+def _loop_sort_key(dev: str):
+    m = re.search(r"(\d+)$", dev)
+    return (int(m.group(1)) if m else -1, dev)
+
+
 def cmd_clean(args):
     """Scavenge the mount base for orphaned mounts and remove them.
 
@@ -1010,6 +1026,7 @@ def cmd_clean(args):
     # immune to the mangling).
     loops_to_detach = set(loop_devices_backing(base))
     pools_to_export = set()
+    lvm_vgs = []
     scratch_to_remove = set()
     base_str = str(base)
     for img in state_mgr.load().mounted_images:
@@ -1017,6 +1034,7 @@ def cmd_clean(args):
         if mb == base_str or mb.startswith(f"{base_str}/"):
             loops_to_detach.update(img.partition_loops or [])
             pools_to_export.update(getattr(img, "zfs_pools", []) or [])
+            lvm_vgs.extend(getattr(img, "lvm_vgs", []) or [])
             # OVA/XVA/DMG/split-raw materialise the evidence in a scratch dir
             # outside the mount base; without this it survives the clean.
             if img.raw_image_path:
@@ -1037,8 +1055,15 @@ def cmd_clean(args):
     for mp in mounts:
         _umount_path(mp)
 
+    # 1b. Release LVM on top of those loops: dm tables MountIR built for any
+    #     mount id under the base (found by UUID, so a lost state file doesn't
+    #     orphan them) and read-only activations recorded in state.
+    mount_ids = {child.name for child in base.iterdir() if child.is_dir()}
+    lvm.teardown(lvm.orphan_dm_devices(mount_ids), lvm_vgs)
+
     # 2. Detach the loop devices gathered above (now released by the unmounts).
-    for dev in sorted(loops_to_detach):
+    #    Highest number first: LV loops sit on PV loops attached before them.
+    for dev in sorted(loops_to_detach, key=_loop_sort_key, reverse=True):
         try:
             run_command(["losetup", "-d", dev], check=False, capture=False)
             logger.info("Detached loop device: %s", dev)

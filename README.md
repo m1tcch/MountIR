@@ -112,11 +112,16 @@ above; tool availability varies by distro.
   and `file(1)` magic, then mounts with driver fallbacks (e.g. `ntfs3` →
   `ntfs-3g`) and a final auto-detect attempt. Reports a best-effort **OS guess**
   (Windows / Linux / macOS).
-- **Partition detection** with `fdisk`/`blkid`, plus **LVM** discovery and
-  activation. Slices the partition table marks as non-filesystem (`freebsd-boot`
+- **Partition detection** with `fdisk`/`blkid`. Slices the partition table marks as non-filesystem (`freebsd-boot`
   bootcode, `freebsd-swap`, Linux swap, BIOS boot, MSR, extended containers) are
   reported as **skipped**, not as mount failures, so the warning count means
   what it says.
+- **LVM2 logical volumes**: every LV in a volume group found on the image is
+  exposed read-only and mounted as its own volume (`p2xx_<fs>_<vg>-<lv>`),
+  without touching the host's LVM state. A VG named like one on the analyst's
+  host (`rhel`, `ubuntu-vg`, …) or in another image of the same batch can't
+  collide with it, and contiguous LVs mount even without device-mapper (WSL2).
+  See [LVM](#lvm).
 - **BitLocker volumes** — a volume `blkid` reports as BitLocker is decrypted
   with `bdemount` and the plaintext volume mounted like any other partition.
   Supply the credential with `--bde-password`, `--bde-recovery-key`,
@@ -303,7 +308,8 @@ Installed automatically by `mountir setup`. The canonical mapping lives in
 | `bdemount` | `libbde-utils` | BitLocker volume unlocking |
 | `vshadowmount` | `libvshadow-utils` | Volume Shadow Copies (`--vss`) |
 | `kpartx` | `kpartx` | Partition device mapping |
-| `pvs` | `lvm2` | LVM detection / activation |
+| `pvs` | `lvm2` | LVM metadata discovery |
+| `dmsetup` | `dmsetup` (pulled in by `lvm2`) | Fragmented / striped / thin LVs |
 | `fusermount` | `fuse` | FUSE unmounting |
 | `ntfs-3g` | `ntfs-3g` | NTFS mounting |
 | `vmfs-fuse` | `vmfs-tools` | VMware **VMFS3/5** datastores |
@@ -321,6 +327,45 @@ sudo apt-get install ewf-tools qemu-utils afflib-tools libvmdk-utils \
                      libvhdi-utils libbde-utils libvshadow-utils \
                      kpartx lvm2 fuse ntfs-3g sleuthkit util-linux file
 ```
+
+### LVM
+
+MountIR reads LVM metadata itself and exposes each logical volume without
+activating the volume group the usual way, because `vgchange -ay` is unsafe on
+an analyst's workstation:
+
+- **Isolated commands.** Every `pvs`/`lvs`/`lvchange`/`vgchange` call carries a
+  `--config` whose device filter accepts *only* this image's devices, turns the
+  lvm2 devices file off, and sets `metadata_read_only`. The host's own VGs are
+  invisible to them, so an evidence VG called `rhel` can't clash with the
+  host's `rhel`, and unmounting can never deactivate the host's root VG.
+- **Least-invasive exposure, per LV:**
+
+  | LV layout | How it is exposed | Needs device-mapper |
+  | --- | --- | --- |
+  | Contiguous (one extent run, the common case) | Read-only offset loop on the PV | No |
+  | Fragmented (e.g. after `lvextend`) or striped | Private read-only dm table (`mountir-<id>-<vg>-<lv>`) built from the metadata | Yes |
+  | Thin, RAID, mirror, cache, snapshot | `lvchange -ay` under the isolated config with `read_only_volume_list` and monitoring off | Yes |
+
+  The third row is refused, with the reason shown, when a VG of the same name
+  already has devices in device-mapper.
+- **Partial VGs.** When a VG spans a disk that isn't in this image, the LVs
+  wholly on the present PVs still mount. The others are listed as
+  `skipped (LV incomplete: …)`. Thin pools are listed as skipped, since they
+  hold other LVs rather than a filesystem.
+- **Teardown** removes MountIR's dm tables, deactivates only LVs of the
+  recorded VG UUID that sit on this image's devices (including any the host's
+  udev auto-activated when the PV appeared), then detaches the loops.
+  `mountir clean` finds MountIR dm tables by their `MOUNTIR-` UUID even when
+  the state file is gone.
+
+Without device-mapper (the stock WSL2 kernel, many containers) contiguous LVs
+still mount. Fragmented, striped and thin LVs are reported as needing
+device-mapper rather than failing obscurely.
+
+Not handled yet: LUKS inside or underneath LVM, MD RAID PVs, a VG whose PVs are
+split across separately-mounted images, and LVM nested inside an LV (e.g. a
+Proxmox guest disk).
 
 ### Filesystem drivers
 
@@ -756,7 +801,9 @@ MountIR/
 ├── bootstrap.py      # dependency declarations + first-run install
 ├── detector.py       # format detection (extension + magic)
 ├── handlers/         # one mount handler per format
-├── partition.py      # partition + LVM detection / mounting
+├── partition.py      # partition detection / mounting
+├── lvm.py            # isolated LVM discovery + read-only LV exposure
+├── zfs.py            # read-only ZFS pool import
 ├── state.py          # JSON mount-state persistence
 ├── utils.py          # logging, subprocess, tool checks, NBD/FUSE helpers
 ├── requirements.txt  # pinned runtime deps

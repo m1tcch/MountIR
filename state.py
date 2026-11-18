@@ -44,7 +44,12 @@ class MountedImage:
     fuse_mounts: List[str] = field(default_factory=list)  # nested FUSE views (BitLocker/VSS)
     raw_image_path: str = ""  # path to raw image exposed by FUSE, or scratch dir
     partitions: List[MountedPartition] = field(default_factory=list)
-    lvm_vg_names: List[str] = field(default_factory=list)
+    lvm_vg_names: List[str] = field(default_factory=list)  # display / legacy entries
+    # One record per evidence VG: {"name", "uuid", "pv_devices", "activated_lvs"}.
+    # The UUID and devices are what make teardown safe when the analyst's host
+    # has a VG of the same name.
+    lvm_vgs: List[dict] = field(default_factory=list)
+    lvm_dm_devices: List[str] = field(default_factory=list)  # dm tables MountIR built
     zfs_pools: List[str] = field(default_factory=list)  # imported ZFS pools to export on unmount
     mounted_at: str = ""    # ISO 8601 timestamp
     handler_class: str = "" # e.g., "EwfHandler"
