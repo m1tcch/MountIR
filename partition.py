@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Partition detection, forensic mounting, and LVM handling.
+"""Partition detection and forensic mounting (LVM lives in ``lvm.py``).
 
 Partition exposure strategy
 ---------------------------
@@ -1178,6 +1178,12 @@ def mount_partition(partition: PartitionInfo, mount_point: Path,
         partition.mount_error = partition.mount_error or "partition was not exposed"
         return partition
 
+    # Exposure already failed and said why (e.g. an LV that needs
+    # device-mapper); mount(8)'s "special device does not exist" would only
+    # bury that diagnosis.
+    if partition.mount_error:
+        return partition
+
     if partition.filesystem in _SKIP_FILESYSTEMS:
         partition.skip_reason = partition.skip_reason or partition.filesystem
         logger.info("Skipping %s (%s)", partition.device, partition.filesystem)
@@ -1557,102 +1563,3 @@ def expose_shadow_copies(partition: PartitionInfo,
         result.partitions.append(snapshot)
 
     return result
-
-
-# ---------------------------------------------------------------------------
-# LVM
-# ---------------------------------------------------------------------------
-# A PV on a whole-disk device we exposed appears as that device plus a kernel
-# partition suffix (``/dev/nbd0`` -> ``/dev/nbd0p1``). Requiring the ``p<N>``
-# separator is what keeps ``/dev/loop1`` from also claiming ``/dev/loop12`` --
-# a bare prefix test would let an unrelated volume group on the analyst's own
-# host be activated here and deactivated again on unmount.
-_PV_PARTITION_SUFFIX_RE = re.compile(r"p\d+$")
-
-
-def _pv_on_devices(pv_name: str, device_set: Set[str]) -> bool:
-    """True when *pv_name* is one of *device_set* or a partition of one."""
-    if pv_name in device_set:
-        return True
-    return any(
-        pv_name.startswith(dev) and _PV_PARTITION_SUFFIX_RE.fullmatch(
-            pv_name[len(dev):])
-        for dev in device_set
-    )
-
-
-def detect_lvm(devices: Union[str, List[str]]) -> List[str]:
-    """Detect LVM volume groups whose physical volumes live on *devices*.
-
-    Accepts a single device path or a list (e.g. the offset loop devices we
-    created for each partition).  A PV matches when it *is* one of the devices
-    or is a kernel partition node of one; unrelated volume groups on the
-    analyst's host are never claimed.
-
-    Returns:
-        List of volume group names found.
-    """
-    if isinstance(devices, str):
-        devices = [devices]
-    device_set = {str(d) for d in devices if d}
-    if not device_set:
-        return []
-
-    vg_names: List[str] = []
-    try:
-        result = run_command(["pvs", "--noheadings", "-o", "pv_name,vg_name"],
-                             check=False, timeout=15)
-        if result.returncode != 0:
-            return []
-
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            pv_name, vg_name = parts[0], parts[1]
-            if _pv_on_devices(pv_name, device_set) and vg_name and vg_name not in vg_names:
-                vg_names.append(vg_name)
-                logger.info("Found LVM volume group: %s on %s", vg_name, pv_name)
-    except FileNotFoundError:
-        logger.debug("pvs not available (lvm2 not installed)")
-    except Exception as e:
-        logger.debug("LVM detection failed: %s", e)
-
-    return vg_names
-
-
-def activate_lvm(vg_names: List[str]) -> List[str]:
-    """Activate LVM volume groups in read-only mode.
-
-    Returns:
-        List of logical volume device paths (e.g., /dev/vg0/lv_root).
-    """
-    lv_paths = []
-    for vg_name in vg_names:
-        try:
-            run_command(["vgchange", "-ay", "--readonly", vg_name], capture=False)
-            logger.info("Activated LVM VG: %s", vg_name)
-
-            result = run_command([
-                "lvs", "--noheadings", "-o", "lv_path", vg_name,
-            ], check=False)
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    lv_path = line.strip()
-                    if lv_path:
-                        lv_paths.append(lv_path)
-                        logger.info("Found LV: %s", lv_path)
-        except Exception as e:
-            logger.error("Failed to activate LVM VG %s: %s", vg_name, e)
-
-    return lv_paths
-
-
-def deactivate_lvm(vg_names: List[str]) -> None:
-    """Deactivate LVM volume groups."""
-    for vg_name in vg_names:
-        try:
-            run_command(["vgchange", "-an", vg_name], capture=False)
-            logger.info("Deactivated LVM VG: %s", vg_name)
-        except Exception as e:
-            logger.error("Failed to deactivate LVM VG %s: %s", vg_name, e)

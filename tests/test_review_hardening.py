@@ -1,7 +1,7 @@
 """Tests for the correctness/security fixes and the EverReady parity features.
 
 Covers, in order: scratch-copy cleanup on unmount, safe tar extraction,
-split-raw via affuse, AFF-in-.001 detection, LVM PV matching, manual offsets,
+split-raw via affuse, AFF-in-.001 detection, manual offsets,
 BitLocker unlocking, Volume Shadow Copies, and state-file resilience.
 """
 
@@ -19,7 +19,7 @@ from detector import ImageType, detect_image_type
 from handlers.base import MountResult
 from handlers.split_raw import SplitRawHandler
 from partition import (
-    PartitionInfo, _pv_on_devices, bitlocker_credential_args, _redacted,
+    PartitionInfo, bitlocker_credential_args, _redacted,
     shadow_copy_count, unlock_bitlocker, expose_shadow_copies,
     expose_partitions, _MOUNT_OPTIONS,
 )
@@ -292,24 +292,6 @@ class TestAffWithDotOhOneExtension:
         image = tmp_path / "evidence.001"
         image.write_bytes(b"\x00" * 64)
         assert detect_image_type(image) == ImageType.RAW
-
-
-# ---------------------------------------------------------------------------
-# LVM physical-volume matching
-# ---------------------------------------------------------------------------
-class TestPvMatching:
-    def test_exact_device_matches(self):
-        assert _pv_on_devices("/dev/loop1", {"/dev/loop1"})
-
-    def test_kernel_partition_of_our_device_matches(self):
-        assert _pv_on_devices("/dev/nbd0p2", {"/dev/nbd0"})
-
-    def test_higher_numbered_sibling_does_not_match(self):
-        """/dev/loop12 is not a partition of /dev/loop1 - it is someone else's."""
-        assert not _pv_on_devices("/dev/loop12", {"/dev/loop1"})
-
-    def test_unrelated_device_does_not_match(self):
-        assert not _pv_on_devices("/dev/sda3", {"/dev/loop1"})
 
 
 # ---------------------------------------------------------------------------
